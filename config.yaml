@@ -256,14 +256,22 @@ files:                       # «найди файл отчёт»
   roots: ["~/Desktop", "~/Documents", "~/Downloads", "~/Pictures", "~/Videos", "D:/"]
   max_index: 300000
 
-lumo:                        # «Передать Люмо» — облачный ассистент; ТОЛЬКО по явной команде, с подтверждением
-  enabled: true              # работает, только когда заданы адрес и ключ (Настройки → Интеграции → Люмо)
+lumo:                        # «Передать Люмо» — облачный ассистент по почте; ТОЛЬКО по явной команде, с подтверждением
+  enabled: true
+  email_to: "lumo-jarvis@mail.grokbot.com"   # адрес Люмо; тема письма «[Джарвис] …»
+  method: "auto"             # auto (Google, иначе SMTP) / gmail / smtp / webhook (для опытных)
+  max_attachments_mb: 15     # общий лимит вложений (снимок экрана, файл)
+  context_turns: 6           # сколько последних реплик разговора приложить
+  timeout_s: 30
+  # запасной способ — свой Gmail + пароль приложения (пароль хранится в Windows, не здесь)
+  smtp_user: ""              # you@gmail.com
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 465             # SSL
+  # webhook (только при method: webhook)
   webhook_url: ""            # https://...
   auth_header: "Authorization"     # заголовок с ключом отправителя
   auth_format: "Bearer {key}"      # формат значения; {key} = ключ (сам ключ хранится в Windows, не здесь)
   extra_key_header: "X-Webhook-Key"   # дублировать ключ в этом заголовке ("" = не дублировать)
-  timeout_s: 30
-  context_turns: 6           # сколько последних реплик чата приложить
 
 diagnostics:                 # «Джарвис, проверь себя»; быстрая тихая проверка при запуске
   enabled: true

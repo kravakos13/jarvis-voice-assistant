@@ -15,6 +15,16 @@ tar --exclude='__pycache__' --exclude='*.pyc' --exclude='.*' --exclude='build' -
     --exclude='voices/*.onnx*' --exclude='settings.local.yaml' --exclude='*.session*' --exclude='tests' \
     --exclude='cache' -cf - jarvis scripts installer assets voices firmware config.yaml aliases.yaml devices.yaml \
     requirements*.txt Jarvis.vbs README.md CHANGELOG.md | tar -xf - -C "$STAGE"
+# Google OAuth client ("Desktop app") for Gmail/Drive - injected at build time, never committed:
+#   JARVIS_OAUTH_CLIENT=/secure/path/oauth_client.json scripts/build_installer.sh
+if [ -n "${JARVIS_OAUTH_CLIENT:-}" ]; then
+  python3 -c "import json,sys;c=json.load(open(sys.argv[1]));c=c.get('installed') or c;assert c['client_id'].endswith('.apps.googleusercontent.com')" "$JARVIS_OAUTH_CLIENT" \
+    || { echo "JARVIS_OAUTH_CLIENT: not a Google Desktop-app client json" >&2; exit 1; }
+  cp "$JARVIS_OAUTH_CLIENT" "$STAGE/oauth_client.json"
+  echo "OAuth client: included"
+else
+  echo "OAuth client: NOT included (Google sign-in disabled in this build; SMTP still works)"
+fi
 # embeddable Python with site-packages + app root on sys.path
 unzip -q "$PY_EMBED" -d "$STAGE/python"
 cat > "$STAGE/python/python311._pth" <<'PTH'

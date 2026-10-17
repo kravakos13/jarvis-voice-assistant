@@ -598,17 +598,59 @@ class SettingsDialog(QDialog):
         row.addWidget(self.tg_status, 1)
         f3.addRow("", row)
         fl = self._group(v, "Люмо (облачный ассистент) — только по твоей команде")
-        self._add(fl, "lumo.webhook_url", "Webhook URL", placeholder="https://…")
+        from ..lumo import DEFAULT_TO
+        self._add(fl, "lumo.email_to", "Адрес Люмо", placeholder=DEFAULT_TO,
+                  tip="Куда уходят задачи. Тема письма начинается с «[Джарвис]»")
+        self._add(fl, "lumo.method", "Способ отправки", "combo",
+                  options=[("auto", "Авто: Google, иначе почта SMTP"), ("gmail", "Только Google (Gmail API)"),
+                           ("smtp", "Только почта SMTP (пароль приложения)"), ("webhook", "Webhook (для опытных)")])
+        self._add(fl, "lumo.max_attachments_mb", "Лимит вложений", "int", min=1, max=20, suffix=" МБ")
+        # --- Google (one sign-in for Gmail sending + Drive sync)
+        row = QHBoxLayout()
+        self.g_connect = QPushButton("Подключить Google")
+        self.g_connect.clicked.connect(self._google_connect)
+        self.g_disconnect = QPushButton("Отключить")
+        self.g_disconnect.clicked.connect(self._google_disconnect)
+        self.g_status = QLabel()
+        self.g_status.setWordWrap(True)
+        row.addWidget(self.g_connect)
+        row.addWidget(self.g_disconnect)
+        row.addWidget(self.g_status, 1)
+        fl.addRow("Google", row)
+        self._google_update()
+        # --- SMTP fallback
+        self._add(fl, "lumo.smtp_user", "Gmail (SMTP)", placeholder="you@gmail.com",
+                  tip="Запасной способ: свой Gmail + пароль приложения (myaccount.google.com → Безопасность → Пароли приложений)")
+        from ..lumo import SMTP_SECRET
         from ..secrets import get_secret, mask
+        self.smtp_pwd = QLineEdit()
+        self.smtp_pwd.setEchoMode(QLineEdit.Password)
+        st = get_secret(SMTP_SECRET)
+        self.smtp_pwd.setPlaceholderText(f"сохранён ({mask(st)}) — оставь пустым, чтобы не менять" if st else "не задан")
+        fl.addRow("Пароль приложения", self.smtp_pwd)
+        self._add(fl, "lumo.smtp_host", "SMTP-сервер", placeholder="smtp.gmail.com")
+        self._add(fl, "lumo.smtp_port", "Порт (SSL)", "int", min=1, max=65535)
+        row = QHBoxLayout()
+        b = QPushButton("Проверить вход")
+        b.clicked.connect(self._smtp_test)
+        b2 = QPushButton("Удалить пароль")
+        b2.clicked.connect(self._smtp_forget)
+        row.addWidget(b)
+        row.addWidget(b2)
+        row.addWidget(QLabel("Пароль и доступ Google хранятся в диспетчере учётных данных Windows."), 1)
+        fl.addRow("", row)
+        # --- webhook (advanced, off unless chosen above)
+        fw = self._group(v, "Люмо: webhook (для опытных, используется только при способе «Webhook»)")
+        self._add(fw, "lumo.webhook_url", "Webhook URL", placeholder="https://…")
         from ..lumo import SECRET_NAME
         self.lumo_key = QLineEdit()
         self.lumo_key.setEchoMode(QLineEdit.Password)
         stored = get_secret(SECRET_NAME)
         self.lumo_key.setPlaceholderText(f"сохранён ({mask(stored)}) — оставь пустым, чтобы не менять" if stored else "не задан")
-        fl.addRow("Ключ отправителя", self.lumo_key)
-        self._add(fl, "lumo.auth_header", "Заголовок ключа", placeholder="Authorization")
-        self._add(fl, "lumo.auth_format", "Формат значения", placeholder="Bearer {key}")
-        self._add(fl, "lumo.extra_key_header", "Дублировать в заголовке", placeholder="X-Webhook-Key")
+        fw.addRow("Ключ отправителя", self.lumo_key)
+        self._add(fw, "lumo.auth_header", "Заголовок ключа", placeholder="Authorization")
+        self._add(fw, "lumo.auth_format", "Формат значения", placeholder="Bearer {key}")
+        self._add(fw, "lumo.extra_key_header", "Дублировать в заголовке", placeholder="X-Webhook-Key")
         row = QHBoxLayout()
         b = QPushButton("Проверить")
         b.clicked.connect(self._lumo_test)
@@ -617,7 +659,7 @@ class SettingsDialog(QDialog):
         row.addWidget(b)
         row.addWidget(b2)
         row.addWidget(QLabel("Ключ хранится в диспетчере учётных данных Windows, не в файлах."), 1)
-        fl.addRow("", row)
+        fw.addRow("", row)
 
         f4 = self._group(v, "Умный дом (devices.yaml)")
         self.devices_edit = QPlainTextEdit()
@@ -861,6 +903,13 @@ class SettingsDialog(QDialog):
         repo = get_path(ch, "update.github_repo") or ""
         if repo and not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
             errs.append("Репозиторий обновлений: формат owner/repo")
+        to = get_path(ch, "lumo.email_to") or ""
+        from ..lumo import EMAIL_RE
+        if to and not EMAIL_RE.match(to):
+            errs.append("Люмо: неверный адрес почты")
+        su = get_path(ch, "lumo.smtp_user") or ""
+        if su and not EMAIL_RE.match(su):
+            errs.append("Люмо: неверный адрес Gmail для SMTP")
         lu = get_path(ch, "lumo.webhook_url") or ""
         if lu and not lu.startswith("https://"):
             errs.append("Люмо: Webhook URL должен начинаться с https://")
@@ -901,11 +950,15 @@ class SettingsDialog(QDialog):
             if getattr(self, "_reset_all", False):
                 LOCAL_SETTINGS.unlink(missing_ok=True)
             save_local_settings(ch)
+            from ..secrets import set_secret
             if self.lumo_key.text().strip():
                 from ..lumo import SECRET_NAME
-                from ..secrets import set_secret
                 set_secret(SECRET_NAME, self.lumo_key.text().strip())
                 self.lumo_key.clear()
+            if self.smtp_pwd.text().strip():
+                from ..lumo import SMTP_SECRET
+                set_secret(SMTP_SECRET, self.smtp_pwd.text().strip())
+                self.smtp_pwd.clear()
             new_dev = self.devices_edit.toPlainText()
             if new_dev != (self._devices_path.read_text(encoding="utf-8") if self._devices_path.exists() else ""):
                 self._devices_path.write_text(new_dev, encoding="utf-8")
@@ -1083,6 +1136,8 @@ class SettingsDialog(QDialog):
             if pct is not None:
                 self.pull_bar.setValue(pct)
             self.pull_label.setText(label)
+        elif name == "google":
+            self._google_update(payload)
         elif name == "geo":
             if isinstance(payload, dict):
                 self._set("weather.latitude", payload["latitude"])
@@ -1206,6 +1261,76 @@ class SettingsDialog(QDialog):
             except Exception as e:
                 self._sig.emit("flash", f"Люмо: {e}")
         threading.Thread(target=work, daemon=True).start()
+
+    def select_tab(self, key: str) -> None:
+        names = {"integrations": "Интеграции", "ui": "Интерфейс", "backup": "Бэкап и синхронизация"}
+        title = names.get(key, key)
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == title:
+                self.tabs.setCurrentIndex(i)
+                return
+
+    def _google_update(self, note: str = "") -> None:
+        from .. import google_auth as ga
+        if not ga.client_available():
+            self.g_connect.setEnabled(False)
+            self.g_disconnect.setEnabled(False)
+            self.g_status.setText("Недоступно в этой сборке (нет ключа приложения Google). Используй почту SMTP ниже.")
+            return
+        on = ga.connected()
+        self.g_connect.setEnabled(True)
+        self.g_connect.setText("Переподключить" if on else "Подключить Google")
+        self.g_disconnect.setEnabled(on)
+        if on:
+            ok = ga.has_scope(ga.SCOPE_GMAIL_SEND)
+            txt = "Подключён ✓" if ok else "Подключён, но без права отправки почты — переподключи"
+        else:
+            txt = "Не подключён. Один вход: отправка писем Люмо + синхронизация через Google Drive."
+        self.g_status.setText(note or txt)
+
+    def _google_connect(self) -> None:
+        from .. import google_auth as ga
+        self.g_connect.setEnabled(False)
+        self.g_status.setText("Жду входа в браузере…")
+
+        def work():
+            try:
+                ga.authorize()
+                self._sig.emit("google", "")
+            except Exception as e:
+                self._sig.emit("google", f"Не подключён: {e}")
+        threading.Thread(target=work, name="jarvis-google-auth", daemon=True).start()
+
+    def _google_disconnect(self) -> None:
+        from .. import google_auth as ga
+        ga.disconnect()
+        self._google_update("Отключён")
+
+    def _smtp_test(self) -> None:
+        from ..lumo import EMAIL_RE, SMTP_SECRET, smtp_check
+        from ..secrets import get_secret
+        user = self._get("lumo.smtp_user")
+        pwd = self.smtp_pwd.text().strip() or get_secret(SMTP_SECRET)
+        if not EMAIL_RE.match(user or "") or not pwd:
+            self._flash("Укажи Gmail и пароль приложения")
+            return
+        cfg = copy.deepcopy(self.cfg)
+        cfg.setdefault("lumo", {}).update(smtp_host=self._get("lumo.smtp_host"), smtp_port=self._get("lumo.smtp_port"))
+        self._flash("Проверяю вход…")
+
+        def work():
+            try:
+                self._sig.emit("flash", smtp_check(cfg, user, pwd))
+            except Exception as e:
+                self._sig.emit("flash", f"Почта: {e}")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _smtp_forget(self) -> None:
+        from ..lumo import SMTP_SECRET
+        from ..secrets import set_secret
+        set_secret(SMTP_SECRET, "")
+        self.smtp_pwd.setPlaceholderText("не задан")
+        self._flash("Пароль удалён")
 
     def _lumo_forget(self) -> None:
         from ..lumo import SECRET_NAME
@@ -1392,7 +1517,7 @@ class SettingsDialog(QDialog):
             return
         data = self.collect()
         # secrets are not exported
-        for path in ("telegram.api_hash", "alerts.alerts_in_ua_token", "lumo.webhook_url"):
+        for path in ("telegram.api_hash", "alerts.alerts_in_ua_token", "lumo.webhook_url", "lumo.smtp_user"):
             set_path(data, path, "")
         Path(p).write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
         self._flash("Экспортировано (без токенов и ключей)")

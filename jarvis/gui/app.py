@@ -384,7 +384,7 @@ class Controller(QObject):
         if self.assistant:
             self.assistant.router.ctx.extra["dropped_files"] = files
 
-    def open_settings(self) -> None:
+    def open_settings(self, tab: Optional[str] = None) -> None:
         from .settings import SettingsDialog
         memory = None
         if self.assistant and "memory" in self.assistant.router.by_name:
@@ -394,6 +394,8 @@ class Controller(QObject):
         self._settings_open = True
         try:
             dlg = SettingsDialog(self.cfg, memory, self.window, controller=self)
+            if tab:
+                dlg.select_tab(tab)
             if not dlg.exec():
                 return
             if getattr(dlg, "changes", None):
@@ -418,7 +420,16 @@ class Controller(QObject):
         from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QPlainTextEdit
         from .. import lumo
         if not lumo.configured(self.cfg):
-            QMessageBox.information(self.window, "Люмо", "Люмо не настроен: Настройки → Интеграции → Люмо (адрес и ключ).")
+            from .. import google_auth as ga
+            if ga.client_available() and not ga.connected() and lumo.method(self.cfg) is None and \
+                    str(self.cfg.get("lumo", {}).get("method", "auto")) in ("auto", "gmail"):
+                if QMessageBox.question(self.window, "Люмо", "Чтобы передавать задачи Люмо по почте, подключи Google "
+                                        "(разрешение только на отправку писем и на файлы Джарвиса в Drive).\n\n"
+                                        "Подключить Google сейчас?") == QMessageBox.StandardButton.Yes:
+                    self.connect_google()
+                return
+            QMessageBox.information(self.window, "Люмо", lumo.not_configured_message(self.cfg))
+            self.open_settings(tab="integrations")
             return
         dlg = QDialog(self.window)
         dlg.setWindowTitle("Передать Люмо")
@@ -428,13 +439,13 @@ class Controller(QObject):
         cb = QCheckBox("Приложить снимок экрана")
         files: list = list(getattr(self, "dropped_files", [])[:1])
         lbl = QLabel(f"Файл: {Path(files[0]).name}" if files else "Файл: нет")
-        pick = QPushButton("Прикрепить файл (до 5 МБ)…")
+        pick = QPushButton(f"Прикрепить файл (до {lumo.max_total(self.cfg) // 1024 // 1024} МБ)…")
 
         def choose():
             p, _ = QFileDialog.getOpenFileName(dlg, "Файл для Люмо")
             if p:
-                if Path(p).stat().st_size > lumo.MAX_FILE:
-                    QMessageBox.warning(dlg, "Люмо", "Файл больше 5 МБ.")
+                if Path(p).stat().st_size > lumo.max_total(self.cfg):
+                    QMessageBox.warning(dlg, "Люмо", f"Файл больше {lumo.max_total(self.cfg) // 1024 // 1024} МБ.")
                     return
                 files[:] = [p]
                 lbl.setText(f"Файл: {Path(p).name}")
@@ -467,8 +478,9 @@ class Controller(QObject):
                     self.emit_from_thread("show")
                 for f in files:
                     atts.append(lumo.file_attachment(f))
-                lumo.send(self.cfg, lumo.build_payload(task or "(см. вложения)", hist, ("", ""), atts))
-                msg = "Передал Люмо, ответ придёт в чат Grok Bot."
+                turns = int(self.cfg.get("lumo", {}).get("context_turns", 6))
+                lumo.send(self.cfg, lumo.build_payload(task or "(см. вложения)", hist, ("", ""), atts, turns))
+                msg = "Передал Люмо."
             except Exception as e:
                 msg = f"Не получилось передать Люмо: {e}"
             if self.assistant:
@@ -476,6 +488,19 @@ class Controller(QObject):
             else:
                 self.emit_from_thread("notice", text=msg)
         threading.Thread(target=work, daemon=True).start()
+
+    def connect_google(self) -> None:
+        """Interactive Google sign-in in the browser (in a thread); result goes to the chat."""
+        from .. import google_auth as ga
+        self.window.add_message("Система", "Открываю вход в Google в браузере…")
+
+        def work():
+            try:
+                ga.authorize()
+                self.emit_from_thread("notice", text="Google подключён ✓ Теперь можно говорить «передай Люмо …».")
+            except Exception as e:
+                self.emit_from_thread("notice", text=f"Google не подключён: {e}")
+        threading.Thread(target=work, name="jarvis-google-auth", daemon=True).start()
 
     # ------------------------------------------------------------ live settings
     def preview_ui(self, g: dict) -> None:
@@ -676,6 +701,9 @@ class Controller(QObject):
             w.add_message("Источники", "", data.get("links", []))
         elif event == "notice":
             w.add_message("Система", data.get("text", ""))
+        elif event == "open_settings":
+            tab = data.get("tab")
+            QTimer.singleShot(300, lambda: self.open_settings(tab=tab))
         elif event == "progress":
             val = data.get("value")
             if val is None or val >= 100:
@@ -774,6 +802,8 @@ class Controller(QObject):
                 from ..assistant import Assistant
                 self.emit_from_thread("state", state="loading")
                 self.assistant = Assistant(self.cfg, speak=self.speak, need_stt=True, on_event=self.emit_from_thread)
+                self.assistant.router.ctx.extra["open_settings"] = \
+                    lambda tab: self.emit_from_thread("open_settings", tab=tab)
                 self.assistant.run_voice()
             except Exception as e:
                 log.exception("Ассистент не запустился: %s", e)
@@ -782,6 +812,8 @@ class Controller(QObject):
                     if self.assistant is None:
                         from ..assistant import Assistant
                         self.assistant = Assistant(self.cfg, speak=self.speak, need_stt=False, on_event=self.emit_from_thread)
+                        self.assistant.router.ctx.extra["open_settings"] = \
+                            lambda tab: self.emit_from_thread("open_settings", tab=tab)
                         self.assistant.greet()
                         self.emit_from_thread("state", state="idle")
                 except Exception as e2:

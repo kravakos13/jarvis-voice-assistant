@@ -12,6 +12,7 @@ SEND_RE = re.compile(r"^(?:передай|перешли|отправь|скин
                      r"^(?:передай|перешли|отправь|скинь)\s+(.+?)\s+(?:люмо|лумо|lumo)$")
 SCREEN_RE = re.compile(r"\b(с экраном|со скриншотом|вместе с экраном|и экран|скрин экрана)\b")
 FILE_RE = re.compile(r"\b(с файлом|и файл|файл тоже)\b")
+SENT_TEXT = "Передал Люмо."
 
 
 class LumoSkill(Skill):
@@ -23,7 +24,13 @@ class LumoSkill(Skill):
 
     def prepare(self, task: str, with_screen: bool = False, files: Optional[list] = None) -> ToolResult:
         if not lumo.configured(self.ctx.cfg):
-            return ToolResult("Люмо не настроен: укажи адрес и ключ в Настройках, вкладка Интеграции.")
+            opener = self.ctx.extra.get("open_settings")      # set by the GUI; absent in text mode
+            if opener:
+                try:
+                    opener("integrations")
+                except Exception:
+                    opener = None
+            return ToolResult(lumo.not_configured_message(self.ctx.cfg, opening=bool(opener)))
         hist = self._history()
         if not task:     # 'отправь это Люмо' -> the last exchange
             last = next((m["content"] for m in reversed(hist) if m.get("role") == "assistant"), "")
@@ -46,8 +53,9 @@ class LumoSkill(Skill):
                         atts.append(lumo.screenshot_attachment())
                     for f in files or []:
                         atts.append(lumo.file_attachment(f))
-                    lumo.send(self.ctx.cfg, lumo.build_payload(task or "(см. вложения)", hist, (exe, title), atts))
-                    self.ctx.say("Передал Люмо, ответ придёт в чат Grok Bot.", "normal")
+                    turns = int(self.ctx.cfg.get("lumo", {}).get("context_turns", 6))
+                    lumo.send(self.ctx.cfg, lumo.build_payload(task or "(см. вложения)", hist, (exe, title), atts, turns))
+                    self.ctx.say(SENT_TEXT, "normal")
                 except Exception as e:
                     self.ctx.say(f"Не получилось передать Люмо: {e}", "normal")
             threading.Thread(target=work, name="jarvis-lumo", daemon=True).start()
