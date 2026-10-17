@@ -1,0 +1,7 @@
+LeePerrySmith.glb — "Infinite, 3D Head Scan" by Lee Perry-Smith
+Licence: Creative Commons Attribution 3.0 Unported (CC BY 3.0) — https://creativecommons.org/licenses/by/3.0/
+Based on a work at www.triplegangers.com. Permissions beyond the scope of this licence may be available at http://www.ir-ltd.net/
+Obtained from the three.js repository: https://github.com/mrdoob/three.js/tree/dev/examples/models/gltf/LeePerrySmith
+(original licence file: LeePerrySmith_License.txt in that folder).
+Changes made for Jarvis: rendered as a hologram with custom shaders; neck and shoulders are cut off in the shader,
+the jaw and eyelids are deformed procedurally for lip sync and blinking. The mesh file itself is unmodified.

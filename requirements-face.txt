@@ -1,0 +1,3 @@
+# Optional: automatic face landmarks for «Своё лицо» (≈200 MB with OpenCV).
+# Without it Джарвис estimates the landmarks and offers the calibration dialog.
+mediapipe>=0.10.14

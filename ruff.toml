@@ -1,0 +1,11 @@
+target-version = "py311"
+line-length = 120
+extend-exclude = ["models", "voices", "build"]
+
+[lint]
+select = ["E", "F", "W", "B"]
+ignore = ["E501", "B008", "E402", "B905", "E702", "E741"]
+
+[lint.per-file-ignores]
+# quick manual smoke scripts (not part of the pytest suite)
+"tests/smoke/*" = ["E401", "E701", "E731", "F401"]

@@ -1,0 +1,66 @@
+# --- Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# --- downloaded models / voices (large, fetched by the installer)
+# (anchored: jarvis/gui/web/models/ holds the bundled 3D head and IS tracked)
+/models/
+voices/*.onnx
+voices/*.onnx.json
+!voices/.gitkeep
+
+# --- user data, secrets, logs (NEVER commit)
+settings.local.yaml
+*.session
+*.session-journal
+telegram*.session*
+/logs/
+# user's own face picture «Своё лицо» (local only; jarvis/gui/web/faces/ IS tracked)
+/faces/
+# local style reference (third-party image, never commit)
+head-reference*.png
+*.log
+*.sqlite3
+*.sqlite3-journal
+.env
+*.token
+secrets*.yaml
+
+# --- build outputs
+build/
+dist/
+installer/Output/
+*.exe
+*.zip
+installer/get-pip.py
+.ruff_cache/
+*.broken
+*.yaml.tmp
+/cache/
+wheels/
+
+# --- credentials / OAuth (Google Drive sync etc.) - NEVER commit
+oauth_client.json
+client_secret*.json
+credentials*.json
+token*.json
+*.pem
+*.key
+*.p12
+.env.*
+
+# --- local preview / test renders (may contain third-party reference images)
+jarvis-face-custom-test*.png
+*-preview*.png
+/screenshots/
+jarvis-screenshots/
+
+# --- other local envs / caches
+venv*/
+.venv*/
+*.part

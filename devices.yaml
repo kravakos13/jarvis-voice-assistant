@@ -1,0 +1,61 @@
+# Устройства умного дома. Голос: «включи свет в комнате», «выключи реле 2», «какая температура в комнате».
+# Пример совпадает с прошивкой firmware/jarvis_esp_relay_dht/jarvis_esp_relay_dht.ino
+# Протоколы: http | mqtt | esphome | tasmota | homeassistant
+
+mqtt:                         # нужен MQTT-брокер (например Mosquitto) — только для protocol: mqtt
+  host: "192.168.1.10"
+  port: 1883
+  username: ""
+  password: ""
+
+homeassistant:                # только для protocol: homeassistant
+  url: "http://homeassistant.local:8123"
+  token: ""                   # Профиль -> Долгосрочные токены доступа
+
+devices:
+  room_light:                 # ESP из примера прошивки, по HTTP
+    name: "свет в комнате"
+    aliases: ["свет", "лампу", "свет в комнате", "реле 1", "реле один"]
+    type: light
+    protocol: http
+    on_url: "http://192.168.1.50/relay/1/on"
+    off_url: "http://192.168.1.50/relay/1/off"
+    state_url: "http://192.168.1.50/relay/1"
+
+  relay2:                     # тот же ESP, второе реле — по MQTT
+    name: "реле 2"
+    aliases: ["реле два", "второе реле", "вентилятор"]
+    type: switch
+    protocol: mqtt
+    command_topic: "jarvis/esp1/relay/2/set"
+    state_topic: "jarvis/esp1/relay/2/state"
+    payload_on: "ON"
+    payload_off: "OFF"
+
+  room_sensor:                # DHT22 на том же ESP
+    name: "датчик в комнате"
+    aliases: ["в комнате", "комнатный датчик", "датчик"]
+    type: sensor
+    protocol: http
+    state_url: "http://192.168.1.50/sensor"
+    fields: {temperature: "temperature", humidity: "humidity"}
+
+  # --- примеры других протоколов (раскомментируй) ---
+  # kitchen_plug:
+  #   name: "розетка на кухне"
+  #   type: switch
+  #   protocol: tasmota
+  #   host: "192.168.1.60"
+  #   relay: 1
+  # desk_lamp:
+  #   name: "настольная лампа"
+  #   type: light
+  #   protocol: esphome         # ESPHome с web_server:
+  #   host: "192.168.1.70"
+  #   domain: light
+  #   entity: "desk_lamp"
+  # hall_light:
+  #   name: "свет в коридоре"
+  #   type: light
+  #   protocol: homeassistant
+  #   entity_id: "light.hall"

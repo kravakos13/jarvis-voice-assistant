@@ -1,0 +1,297 @@
+# =====================================================================
+#  Джарвис — настройки. Файл в UTF-8. После правки перезапусти ассистента.
+#  Изменения из окна «Настройки» сохраняются в settings.local.yaml
+#  (он накладывается поверх этого файла).
+# =====================================================================
+
+config_version: 2            # версия схемы настроек (миграции выполняются автоматически)
+
+assistant:
+  name: "Джарвис"            # имя = слово-активатор. Поменяй тут — варианты/падежи сгенерируются сами
+  extra_wake_words: ["jarvis", "джарвиз", "жарвис", "джервис", "джарвес"]   # доп. варианты распознавания
+  user_name: "Флоки"
+  mode: "wake"               # wake — по имени; ptt — по горячей клавише (push-to-talk)
+  wake_reply: "Слушаю"       # ответ, если сказали только имя
+  greet_on_start: true
+  greeting: "{hello}, мистер {user_name}, чего желаете?"   # {hello} = «Добрый день»
+  greeting_time_of_day: false   # true: «Доброе утро / Добрый день / Добрый вечер / Доброй ночи» по времени
+  follow_up_seconds: 6       # после ответа N секунд слушаю без имени (0 — выкл.)
+
+stt:                         # распознавание речи faster-whisper
+  model: "small"             # tiny / base / small / medium / large-v3 (больше = точнее, но медленнее)
+  device: "auto"             # auto (cuda если есть) / cuda / cpu
+  compute_type: "auto"       # auto: cuda->float16, cpu->int8. GTX 16xx: если глючит, поставь int8_float32 или float32
+  language: "ru"
+  beam_size: 1
+  download_root: "models/whisper"
+  initial_prompt: "Джарвис, привет. Джарвис, включи музыку."   # подсказка Whisper, чтобы имя распознавалось
+
+audio:
+  input_device: null         # null = по умолчанию; номер или часть названия (см. run.bat --list-devices)
+  output_device: null
+  vad: "webrtc"              # webrtc / energy
+  vad_aggressiveness: 2      # 0..3: выше = строже отсекает шум
+  energy_threshold: 0.015
+  silence_ms: 800            # пауза, после которой фраза считается законченной
+  min_speech_ms: 250
+  max_utterance_s: 15
+
+llm:
+  host: "http://localhost:11434"
+  model: "qwen2.5:7b"        # основная модель Ollama (хорошо знает русский, ~4.7 ГБ)
+  temperature: 0.8
+  num_ctx: 4096
+  max_history_messages: 16
+  keep_alive: "30m"          # держать основную модель в памяти
+  aux_keep_alive: "1m"       # доп. модели (код, зрение) выгружаются быстро — экономим 6 ГБ VRAM
+  answer_length: "short"     # short / normal / long — длина ответов
+  tool_calling: true         # модель сама вызывает функции (музыка, поиск, задачи...)
+  # Личность. {name} и {user_name} подставляются. Пусто = встроенный промпт (см. jarvis/config.py)
+  system_prompt: |
+    Ты — {name}, личный голосовой ассистент мистера {user_name}. Живёшь на его компьютере и работаешь офлайн.
+    Стиль: как Джарвис из «Железного человека», но без чопорности — общаешься на «ты», неформально, по-дружески,
+    с живым юмором и иронией. Иногда, к месту, можешь назвать его «сэр» или «мистер {user_name}», но не в каждой фразе.
+    Понимаешь сленг, мемы, сарказм и шутки, шутишь в ответ. Русский мат — нормальная часть живой речи: если
+    собеседник матерится, спокойно поддерживай тот же стиль и сам можешь крепко выразиться к месту. Никогда не
+    читай нотаций про лексику и не морализируй. Ответы будут произнесены вслух, поэтому коротко: обычно одно-три
+    предложения, как в живом разговоре. Без markdown, списков, эмодзи и кода, если прямо не просят.
+    Отвечай по-русски. Если чего-то не знаешь — честно скажи, без выдумок.
+
+tts:
+  engine: "piper"            # piper / pyttsx3 / none
+  piper_voice: "ru_RU-denis-medium"   # мужские: ru_RU-denis-medium, ru_RU-dmitri-medium, ru_RU-ruslan-medium; женский: ru_RU-irina-medium
+  voices_dir: "voices"
+  length_scale: 1.1          # >1 медленнее, <1 быстрее (1.1 — спокойная подача в стиле J.A.R.V.I.S.)
+  volume: 1.0
+  pitch_semitones: 0.0       # высота голоса, полутона (-6..+6); отрицательные = ниже, «бархатнее»
+  fx:                        # лёгкая обработка голоса «ИИ из Железного человека» (без клонирования голосов)
+    enabled: true
+    intensity: 0.35          # 0..1: фильтр, компрессия, лёгкий металлик/хорус и короткий ревербератор
+  pyttsx3_voice: ""          # запасной голос Windows (SAPI), часть имени, напр. "Pavel"
+  speak_in_text_mode: true
+
+gui:
+  enabled: true
+  always_on_top: false
+  start_minimized: false
+  close_to_tray: true        # крестик = свернуть в трей
+  hotkey_show: "ctrl+alt+j"  # показать/скрыть окно
+  hotkey_ptt: "ctrl+alt+space"   # удерживать — говорить (в любом режиме)
+  hotkey_game: "ctrl+alt+g"  # удерживать — вопрос по текущей игре
+  hotkey_mic: "ctrl+alt+m"   # пауза микрофона (приватность): вкл/выкл
+  fps: 30
+  width: 460
+  height: 780
+  opacity: 1.0               # прозрачность окна 0.3..1
+  color: "#46dcff"           # цвет голограммы
+  subtitles: true            # показывать журнал/субтитры
+  animations: "full"         # full / lite (слабый ПК) / off
+  face_style: "image"        # лицо: image («Своё лицо», картинка в WebGL) / 3d (3D-голова) / 2d (без WebGL)
+  face_image: "default"      # default (стандартное лицо) / custom (своя картинка из папки faces, только этот ПК)
+  face_colors: "auto"        # auto (своя картинка — как есть, встроенное — под голограмму) / hologram / original
+  face_prompted: false       # первый запуск уже спросил про своё лицо
+  face_image_path: ""        # откуда была взята своя картинка (только для справки, копия лежит в faces/)
+
+autostart:
+  enabled: true              # install.bat кладёт ярлык в автозагрузку; переключатель в трее и голосом
+
+tools:                       # базовые команды
+  enabled: true
+  allow_open_websites: true
+  search_url: "https://www.google.com/search?q={query}"
+  websites:
+    гугл: "https://www.google.com"
+    яндекс: "https://ya.ru"
+    википедию: "https://ru.wikipedia.org"
+    вконтакте: "https://vk.com"
+    гитхаб: "https://github.com"
+    почту: "https://mail.google.com"
+    карты: "https://www.google.com/maps"
+  apps:                      # явный белый список (плюс всё из меню Пуск — см. apps)
+    блокнот: "notepad.exe"
+    калькулятор: "calc.exe"
+    paint: "mspaint.exe"
+    проводник: "explorer.exe"
+    диспетчер задач: "taskmgr.exe"
+
+apps:                        # игры (Steam/Epic) и любые программы из меню Пуск / рабочего стола
+  enabled: true
+  min_score: 0.72            # строгость нечёткого поиска (0..1). Псевдонимы — в aliases.yaml
+
+media:                       # YouTube / YouTube Music (как приложения Chrome)
+  enabled: true
+  chrome_path: ""            # пусто = найти автоматически
+  youtube_app: {app_id: "", profile_directory: "", shortcut: ""}   # пусто = взять из ярлыка «Chrome Apps\YouTube.lnk»
+  ytmusic_app: {app_id: "", profile_directory: "", shortcut: ""}
+
+notes:
+  enabled: true
+  dir: ""                    # пусто = Документы\Jarvis\Notes
+  open_in_notepad: false
+
+planner:
+  enabled: true
+  dir: ""                    # пусто = Документы\Jarvis (planner.sqlite3)
+  morning_summary_time: "09:00"   # пусто = без утренней сводки
+  llm_date_fallback: true
+
+timers: {enabled: true}
+system: {enabled: true}      # громкость, блокировка, сон/перезагрузка/выключение (с подтверждением), скриншот, статус ПК
+calc: {enabled: true}
+clipboard: {enabled: true}
+
+weather:
+  enabled: true
+  city: "Сумы"
+  latitude: 50.9077
+  longitude: 34.7981
+  timezone: "Europe/Kyiv"
+
+web_search:                  # ответы из интернета (как ChatGPT с поиском)
+  enabled: true
+  backend: "duckduckgo"      # duckduckgo / searxng
+  searxng_url: ""            # напр. http://localhost:8080
+  region: "ru-ru"
+  max_results: 5
+  fetch_pages: 4
+  timeout_s: 8
+  cache_minutes: 15
+
+memory:                      # долговременная память
+  enabled: true
+  dir: ""
+  use_embeddings: true
+  embed_model: "nomic-embed-text"   # ollama pull nomic-embed-text (≈270 МБ); без неё — поиск по словам
+  top_k: 5
+  min_score: 0.45
+  summaries: true
+
+screen:                      # «что на экране», «объясни ошибку»
+  enabled: true
+  vision_model: "qwen2.5vl:3b"      # ollama pull qwen2.5vl:3b (≈3.2 ГБ)
+  fallback_models: ["moondream"]    # лёгкая (≈1.7 ГБ), понимает только английский — ответ переводится
+  tesseract_path: ""                # необязательно: OCR Tesseract (rus+eng)
+
+game:                        # помощь в играх
+  enabled: true
+
+code:                        # Arduino / ESP32 / ESP8266 / STM32
+  enabled: true
+  model: "qwen2.5-coder:7b"  # ollama pull qwen2.5-coder:7b (≈4.7 ГБ)
+  dir: ""                    # пусто = Документы\Jarvis\Code
+  open_in_editor: true
+  arduino_cli: "arduino-cli"
+  port: ""                   # COM-порт платы, пусто = авто
+  fqbn: {arduino: "arduino:avr:uno", esp32: "esp32:esp32:esp32", esp8266: "esp8266:esp8266:nodemcuv2"}
+
+cad:                         # 3D-модели
+  enabled: true
+  model: "qwen2.5-coder:7b"
+  dir: ""                    # пусто = Документы\Jarvis\Models
+  openscad_path: ""          # пусто = искать в C:\Program Files\OpenSCAD
+  open_preview: true
+  timeout_s: 180
+
+smarthome:
+  enabled: true
+  devices_file: "devices.yaml"
+  timeout_s: 5
+
+telegram:
+  enabled: false             # включи после настройки (см. README)
+  api_id: 0                  # с https://my.telegram.org -> API development tools
+  api_hash: ""
+  notify_new_messages: false # озвучивать новые сообщения сразу (по умолчанию выкл.)
+  notify_whitelist: []       # только от этих чатов/людей
+  mark_read: false
+  max_chats: 5
+  per_chat: 3
+
+translator:                  # «переведи на английский ...», «режим переводчика»
+  enabled: true              # английский голос en_US-ryan-medium скачивается при первом переводе
+
+dictate:                     # диктовка в любое активное окно: «Джарвис, диктовка» ... «стоп диктовка»
+  enabled: true
+  hotkey: "ctrl+alt+d"       # горячая клавиша вкл/выкл диктовки
+
+monitor:                     # температура ПК и предупреждения о перегреве
+  enabled: true
+  interval_s: 30
+  gpu_temp_warn: 83
+  cpu_temp_warn: 90
+  cooldown_min: 10           # не повторять предупреждение чаще
+  lhm_url: "http://localhost:8085/data.json"   # LibreHardwareMonitor -> Options -> Remote Web Server
+  wmi_fallback: true
+
+alerts:                      # воздушные тревоги (говорит ВСЕГДА, даже в ночном/игровом режиме)
+  enabled: true
+  backend: "siren"           # siren (без ключа) / alerts_in_ua (нужен токен) / ubilling (без ключа, только область)
+  oblast: "Сумська область"
+  raions: []                 # пусто = вся область; напр. ["Сумський район"] — только свой район
+  interval_s: 20
+  announce_on_start: true    # если при запуске уже тревога — сказать
+  alerts_in_ua_token: ""     # https://alerts.in.ua/api-request
+
+profiles:                    # режимы: work (обычный), game (игровой), night (ночной)
+  enabled: true
+  default: "work"
+  auto_game_mode: true       # сам включать игровой режим, когда запущена полноэкранная игра / игра Steam
+  night_volume: 0.45
+  game_reminders_voice: true # в игровом режиме напоминания вслух (false — только уведомление)
+  game_notifications: false  # второстепенные уведомления в игре
+  night_reminders_voice: false   # ночью напоминания только уведомлением
+  night_notifications: false
+  night_schedule: {enabled: false, start: "23:00", end: "07:00"}   # ночной режим по расписанию
+
+audio_devices:               # «переключи на наушники / колонки»
+  enabled: true
+  aliases:                   # что говоришь -> часть имени устройства в Windows
+    наушники: "Headphones"
+    колонки: "Speakers"
+    динамики: "Speakers"
+
+files:                       # «найди файл отчёт»
+  enabled: true
+  use_windows_search: true   # индекс поиска Windows (быстро)
+  roots: ["~/Desktop", "~/Documents", "~/Downloads", "~/Pictures", "~/Videos", "D:/"]
+  max_index: 300000
+
+lumo:                        # «Передать Люмо» — облачный ассистент; ТОЛЬКО по явной команде, с подтверждением
+  enabled: true              # работает, только когда заданы адрес и ключ (Настройки → Интеграции → Люмо)
+  webhook_url: ""            # https://...
+  auth_header: "Authorization"     # заголовок с ключом отправителя
+  auth_format: "Bearer {key}"      # формат значения; {key} = ключ (сам ключ хранится в Windows, не здесь)
+  extra_key_header: "X-Webhook-Key"   # дублировать ключ в этом заголовке ("" = не дублировать)
+  timeout_s: 30
+  context_turns: 6           # сколько последних реплик чата приложить
+
+diagnostics:                 # «Джарвис, проверь себя»; быстрая тихая проверка при запуске
+  enabled: true
+  check_on_start: true       # сообщать только о проблемах
+
+backup:                      # ежедневный бэкап заметок, задач, памяти и настроек
+  enabled: true
+  dir: ""                    # пусто = Документы\Jarvis\Backups
+  keep: 10                   # хранить последних N
+  every_days: 1
+  include_telegram: false    # сессия Telegram = ключ входа, по умолчанию не бэкапится
+
+sync:                        # синхронизация между ПК через общую папку (Google Drive / OneDrive / Dropbox / сеть / флешка)
+  folder: ""                 # пусто = выкл.; выбирается в Настройках → Бэкап и синхронизация
+  device_name: ""            # имя этого ПК (пусто = имя компьютера)
+  auto_on_start: false
+  auto_on_exit: false
+  interval_min: 0            # 0 = только вручную
+
+update:
+  github_repo: "kravakos13/jarvis-voice-assistant"   # owner/repo с релизами (asset JarvisSetup.exe, тег vX.Y.Z); пусто = выкл.
+  check_on_start: true       # проверять при запуске (в фоне, не чаще раза в сутки), обновление только с твоего согласия
+  skip_version: ""           # «Пропустить эту версию»
+
+vram:                        # освобождение видеопамяти в играх (6 ГБ — мало)
+  release_in_game: true      # в игровом режиме выгрузить модели Ollama и перевести Whisper на CPU
+  whisper_in_game: "cpu"     # cpu / unload
+
+logging:
+  level: "INFO"
+  file: "logs/jarvis.log"

@@ -1,0 +1,3 @@
+# Optional: CadQuery path for STEP export (SolidWorks-friendly). Heavy (~400 MB).
+#   .venv\Scripts\pip install -r requirements-cad.txt
+cadquery>=2.4
