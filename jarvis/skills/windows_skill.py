@@ -175,12 +175,10 @@ class WindowsSkill(Skill):
 
     def tools(self):
         return [
-            fn("close_window", "Закрыть открытое окно программы/сайта на компьютере (YouTube, YouTube Music, Chrome, "
-               "Steam, блокнот и т.п.). Пустой target = текущее активное окно.",
-               {"target": s("что закрыть, например «ютуб», «хром», «стим»; пусто = активное окно")}),
+            fn("close_window", "Закрыть окно программы или сайта (ютуб, хром, стим…).",
+               {"target": s("что закрыть; пусто = активное окно")}),
             fn("window_action", "Свернуть или развернуть окно.",
-               {"action": s("действие", ["minimize", "maximize"]),
-                "target": s("какое окно; пусто = активное, «все» = свернуть все")}, ["action"]),
+               {"action": s("", ["minimize", "maximize"]), "target": s("пусто = активное, «все» = все")}, ["action"]),
         ]
 
     def call(self, name: str, args: dict) -> Optional[ToolResult]:

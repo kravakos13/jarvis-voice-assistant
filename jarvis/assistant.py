@@ -14,16 +14,17 @@ import queue
 import re
 import threading
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
 from .config import PROJECT_ROOT
-from .llm import LLMError, OllamaChat, SentenceSplitter, has_cjk, not_russian, strip_cjk
+from .llm import LLMError, OllamaChat, SentenceSplitter, has_cjk, not_russian, strip_cjk, strip_note
 from .router import Router
 from .skills.base import SkillContext, ToolResult
 from .wake import WakeWordDetector
 from .wakeflow import WakeFlow
+from .timing import Timings, Trace
 
 log = logging.getLogger("jarvis")
 
@@ -65,6 +66,8 @@ def greeting_text(a: dict, now: Optional[_dt.datetime] = None) -> str:
 
 
 class Assistant:
+    _saved_keep_alive: Any = None        # game mode (GPU placement): keep_alive before unloading
+    _llm_moved: bool = False             # game mode (auto placement): model moved to RAM
     def __init__(self, cfg: dict, speak: bool = True, need_stt: bool = True,
                  on_event: Optional[Callable[..., None]] = None):
         self.cfg = cfg
@@ -119,7 +122,19 @@ class Assistant:
             self.emit("notice", text="Загружаю распознавание речи...")
             self.stt = SpeechToText(cfg["stt"])
 
-        self._commands: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self.timings = Timings()
+        self._trace: Optional[Trace] = None
+        self._stt_last: Optional[tuple[float, float]] = None     # (start, seconds) of the last transcription
+        self._ack_text = ""
+        self.llm.warm_tools = self.router.tool_schemas() if self.tool_calling else None
+        if self.llm.placement == "cpu":
+            self.llm.on_cpu = True
+        # after Whisper took its VRAM: load the LLM and pre-evaluate system prompt + tools, so the first
+        # command is not a cold start (several seconds on a 6 GB card)
+        if self.llm_ok and cfg["llm"].get("warm_up", True):
+            threading.Thread(target=self.llm.warm, args=(self.llm.warm_tools,), name="llm-warm", daemon=True).start()
+
+        self._commands: "queue.Queue[tuple]" = queue.Queue()
         self._idle = threading.Event()
         self._idle.set()
         self._brain = threading.Thread(target=self._brain_loop, name="jarvis-brain", daemon=True)
@@ -158,6 +173,12 @@ class Assistant:
 
     def _on_tts(self, event: str, **data) -> None:
         if event == "speech_start":
+            tr = getattr(self, "_trace", None)
+            if tr is not None:
+                if self._ack_text and data.get("text") == self._ack_text:
+                    self._ack_text = ""                       # «Секунду» is not the answer
+                else:
+                    tr.mark("first_audio")
             self.emit("state", state="speaking")
             self.emit("speech", **data)
         elif event == "speech_end":
@@ -257,9 +278,13 @@ class Assistant:
         except Exception as e:
             log.error("wake words: %s", e)
         self.mode = a.get("mode", self.mode)
+        old_model = self.llm.model
         self.llm.model = l.get("model", self.llm.model)
-        self.llm.temperature = float(l.get("temperature", 0.8))
+        self.llm.temperature = float(l.get("temperature", 0.6))
         self._compose_prompt()
+        moved = self.apply_placement(str(l.get("placement", "gpu") or "gpu").lower())
+        if self.llm.model != old_model and not moved and self.llm_ok:
+            threading.Thread(target=self.llm.warm, args=(self.llm.warm_tools,), daemon=True).start()
         eng = self.speaker.engine if self.speaker else None
         if eng is not None and hasattr(eng, "length_scale"):
             eng.length_scale = float(t.get("length_scale", 1.0))
@@ -268,6 +293,25 @@ class Assistant:
             fx = t.get("fx") or {}
             eng.fx_enabled = bool(fx.get("enabled", False))
             eng.fx_intensity = float(fx.get("intensity", 0.35))
+
+    def apply_placement(self, placement: str) -> bool:
+        """Settings → «Где работает ИИ» changed: move the model now (no restart). Returns True if it moved."""
+        if placement not in ("gpu", "cpu", "auto"):
+            placement = "gpu"
+        if placement == self.llm.placement:
+            return False
+        self.llm.placement = placement
+        in_game = self.profile == "game" and self.cfg.get("vram", {}).get("release_in_game", True)
+        if getattr(self, "_saved_keep_alive", None) is not None and placement != "gpu":
+            self.llm.keep_alive = self._saved_keep_alive       # GPU-unload of the game mode is not needed now
+            self._saved_keep_alive = None
+        want_cpu = placement == "cpu" or (placement == "auto" and in_game)
+        self._llm_moved = placement == "auto" and in_game
+        if placement == "gpu" and in_game:                     # behave like the GPU game mode: free VRAM
+            self.llm.on_cpu = False
+            self.release_gpu()
+            return True
+        return self.llm.set_on_cpu(want_cpu)
 
     # ------------------------------------------------------------ privacy / VRAM
     def set_mic_muted(self, muted: bool, cue: bool = True) -> None:
@@ -308,19 +352,31 @@ class Assistant:
         vc = self.cfg.get("vram", {})
         if not vc.get("release_in_game", True):
             return
-        self._saved_keep_alive = getattr(self, "_saved_keep_alive", None) or self.llm.keep_alive
-        self.llm.keep_alive = 0
-        threading.Thread(target=self.llm.unload_all, daemon=True).start()
+        placement = self.llm.placement
+        if placement == "auto":
+            # keep answering in games: the model moves to RAM (num_gpu=0) instead of being unloaded
+            self._llm_moved = self.llm.set_on_cpu(True)
+        elif placement == "gpu":
+            self._saved_keep_alive = getattr(self, "_saved_keep_alive", None) or self.llm.keep_alive
+            self.llm.keep_alive = 0
+            threading.Thread(target=self.llm.unload_all, daemon=True).start()
+        # placement "cpu": the model is in RAM already, nothing to free
         if self.stt is not None and getattr(self.stt, "device", "cpu") == "cuda":
             mode = vc.get("whisper_in_game", "cpu")
             threading.Thread(target=self.stt.relocate, args=("cpu" if mode == "cpu" else None,), daemon=True).start()
         log.info("VRAM освобождена для игры")
 
     def restore_gpu(self) -> None:
+        if getattr(self, "_llm_moved", False):
+            self._llm_moved = False
+            self.llm.set_on_cpu(False)                # back to the GPU (re-warmed in the background)
         if getattr(self, "_saved_keep_alive", None) is None:
+            if self.stt is not None and getattr(self.stt, "relocated", False):
+                threading.Thread(target=self.stt.relocate, args=("restore",), daemon=True).start()
             return
         self.llm.keep_alive = self._saved_keep_alive
         self._saved_keep_alive = None
+        threading.Thread(target=self.llm.warm, args=(self.llm.warm_tools,), daemon=True).start()
         if self.stt is not None and getattr(self.stt, "relocated", False):
             threading.Thread(target=self.stt.relocate, args=("restore",), daemon=True).start()
         log.info("Игра закрыта — модели снова на GPU (по запросу)")
@@ -345,11 +401,45 @@ class Assistant:
             self.say(greeting_text(self.cfg["assistant"]), wait=True)
 
     # ------------------------------------------------------------------ command processing
-    def submit(self, text: str, source: str = "text") -> None:
+    def submit(self, text: str, source: str = "text", trace: Optional[Trace] = None) -> None:
         """Queue a user command (from the GUI text box, voice loop, or console)."""
         if text and text.strip():
             self._idle.clear()
-            self._commands.put((text.strip(), source))
+            self._commands.put((text.strip(), source, trace))
+
+    def _transcribe(self, audio, language=None) -> str:
+        """Whisper with timing (the trace of the command starts when the user stopped speaking)."""
+        t0 = time.monotonic()
+        text = self.stt.transcribe(audio, language=language) if self.stt is not None else ""
+        self._stt_last = (t0, time.monotonic() - t0)
+        return text
+
+    def _voice_trace(self, command: str) -> Trace:
+        if self._stt_last:
+            t0, dur = self._stt_last
+            tr = Trace(command, "voice", t0=t0)
+            tr.add("stt", dur)
+            return tr
+        return Trace(command, "voice")
+
+    def _start_ack(self, tr: Trace, source: str) -> Optional[threading.Timer]:
+        """Slow answer (web search, long LLM turn): after ack_after_s of silence say a short «Секунду»."""
+        try:
+            after = float(self.cfg["assistant"].get("ack_after_s", 2.5) or 0)
+        except (TypeError, ValueError):
+            after = 0.0
+        if after <= 0 or source != "voice" or not self.speaker:
+            return None
+
+        def ack():
+            if self._trace is tr and tr.get("first_audio") is None and "ack" not in tr.marks:
+                tr.mark("ack")
+                self._ack_text = "Секунду."
+                self.speaker.say(self._ack_text)
+        t = threading.Timer(after, ack)
+        t.daemon = True
+        t.start()
+        return t
 
     def wait_idle(self, timeout: Optional[float] = None) -> bool:
         return self._idle.wait(timeout)
@@ -357,9 +447,12 @@ class Assistant:
     def _brain_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                text, source = self._commands.get(timeout=0.3)
+                text, source, trace = self._commands.get(timeout=0.3)
             except queue.Empty:
                 continue
+            tr = trace or Trace(text, source)
+            self._trace = tr
+            ack = self._start_ack(tr, source)
             try:
                 self.emit("user_text", text=text, source=source)
                 if self.respond(text) == "exit":
@@ -369,8 +462,15 @@ class Assistant:
                 log.exception("Ошибка обработки команды: %s", e)
                 self.say("Что-то пошло не так, глянь лог.")
             finally:
+                if ack is not None:
+                    ack.cancel()
                 if self.speaker:
                     self.speaker.wait()
+                self._trace = None
+                try:
+                    self.timings.finish(tr)
+                except Exception as e:
+                    log.debug("timing: %s", e)
                 if self._commands.empty():
                     self.emit("state", state="idle")
                     self._idle.set()
@@ -410,7 +510,12 @@ class Assistant:
         if not text:
             return None
         self.emit("state", state="thinking")
+        tr = getattr(self, "_trace", None)
+        t0 = time.monotonic()
         r = self.router.handle(text)
+        if tr is not None:
+            tr.add("route", time.monotonic() - t0)
+            tr.path = (getattr(self.router, "last_skill", "") or "?") if r is not None else "llm"
         if r is not None:
             return self._run_result(r)
         return self._chat(text)
@@ -446,13 +551,20 @@ class Assistant:
             return True
         try:
             stream = self.llm.stream(text, tools=tools, tool_calls_out=calls)
+            tr = getattr(self, "_trace", None)
             for piece in stream:
+                if tr is not None:
+                    tr.mark("llm_first")
                 if any(not out(sn) for sn in splitter.feed(piece)) or self.stop_event.is_set():
                     break
             else:
                 for sn in splitter.flush():
                     if not out(sn):
                         break
+            if tr is not None:
+                tr.mark("llm_first")                       # tool-call-only answers have no text pieces
+                tr.mark("llm_done")
+                tr.llm_stats = dict(getattr(self.llm, "last_stats", None) or {})
             if drift:
                 close = getattr(stream, "close", None)
                 if close:
@@ -517,7 +629,8 @@ class Assistant:
     def _summarize_async(self, messages: list) -> None:
         mem = self.router.by_name.get("memory")
         if mem and messages and self.cfg.get("memory", {}).get("summaries", True):
-            threading.Thread(target=mem.memory.summarize, args=(list(messages),), daemon=True).start()
+            plain = [dict(m, content=strip_note(m.get("content", ""))) for m in messages]
+            threading.Thread(target=mem.memory.summarize, args=(plain,), daemon=True).start()
 
     # ------------------------------------------------------------------ text mode
     def run_text(self) -> None:
@@ -573,7 +686,7 @@ class Assistant:
 
     def _execute_voice(self, mic, command: str) -> None:
         print(f"Ты: {command}")
-        self.submit(command, "voice")
+        self.submit(command, "voice", self._voice_trace(command))
         self.wait_idle()
         mic.clear()
 
@@ -592,7 +705,7 @@ class Assistant:
             detect=lambda t: self.wake.detect(t),
             listen=lambda timeout=None, silence_ms=None, max_s=None: self._listen(
                 mic, vad, timeout=timeout, silence_ms=silence_ms, max_s=max_s, abort=lambda: self.mode != "wake"),
-            transcribe=lambda audio: self.stt.transcribe(audio, language=self.router.stt_language()),
+            transcribe=lambda audio: self._transcribe(audio, language=self.router.stt_language()),
             say=say,
             execute=lambda command: self._execute_voice(mic, command),
             emit=lambda st: self.emit("state", state="muted" if self.mic_muted else st),
@@ -628,7 +741,7 @@ class Assistant:
                     if not chunks:
                         continue
                     self.emit("state", state="thinking")
-                    text = self.stt.transcribe(np.concatenate(chunks), language=self.router.stt_language())
+                    text = self._transcribe(np.concatenate(chunks), language=self.router.stt_language())
                     if text:
                         wr = self.wake.detect(text)
                         self._execute_voice(mic, wr.command if wr.detected and wr.command else text)

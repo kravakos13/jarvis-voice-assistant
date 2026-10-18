@@ -1,3 +1,3 @@
 """Jarvis (Джарвис) - offline Russian voice assistant."""
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"

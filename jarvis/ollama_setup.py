@@ -170,8 +170,17 @@ def _spawn_hidden(argv: list, env: Optional[dict] = None) -> subprocess.Popen:
                             stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags, env=env)
 
 
-def _serve_env(host: str) -> dict:
+SERVER_ENV = {"OLLAMA_FLASH_ATTENTION": "1",   # less VRAM for attention; needed for the q8 KV cache
+              "OLLAMA_KV_CACHE_TYPE": "q8_0",   # KV cache at half size, quality loss is negligible
+              "OLLAMA_NUM_PARALLEL": "1"}       # one conversation -> one KV cache (parallel slots multiply VRAM)
+
+
+def _serve_env(host: str, extra: Optional[dict] = None) -> dict:
+    """Environment for an Ollama started by Jarvis. The user's own OLLAMA_* variables always win."""
     env = dict(os.environ)
+    for k, v in (SERVER_ENV if extra is None else extra).items():
+        if v is not None and str(v) != "" and k not in os.environ:
+            env[str(k)] = str(v)
     port = urllib.parse.urlparse(host).port
     if port and port != 11434:
         env["OLLAMA_HOST"] = f"127.0.0.1:{port}"
@@ -210,14 +219,14 @@ def start(cfg: dict, wait: float = 30.0, session=requests, popen=_spawn_hidden, 
     app = find_app(exe) if oc.get("start_tray_app", True) else None
     if app:
         try:
-            popen([app])
+            popen([app], env=_serve_env(host, oc.get("server_env")))
             log.info("Запущено приложение Ollama: %s", app)
             if wait_until(min(end, clock() + 12)):
                 return True
         except OSError as e:
             log.warning("Приложение Ollama не запустилось: %s", e)
     try:
-        popen([exe, "serve"], env=_serve_env(host))
+        popen([exe, "serve"], env=_serve_env(host, oc.get("server_env")))
         log.info("Запущен скрытый сервер: %s serve", exe)
     except OSError as e:
         log.warning("ollama serve не запустился: %s", e)

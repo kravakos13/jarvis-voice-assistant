@@ -41,7 +41,8 @@ def pick_device(device: str = "auto", compute_type: str = "auto") -> tuple[str, 
         except Exception:
             device = "cpu"
     if not compute_type or compute_type == "auto":
-        compute_type = "float16" if device == "cuda" else "int8"
+        # int8_float16: ~2x less VRAM than float16 and faster on GTX 16xx (no tensor cores), same accuracy
+        compute_type = "int8_float16" if device == "cuda" else "int8"
     return device, compute_type
 
 

@@ -55,7 +55,7 @@ def test_system_prompt_always_ends_with_russian_rule_and_sane_options():
     assert p["messages"][0]["role"] == "system" and p["messages"][0]["content"].endswith(L.RU_RULE)
     o = p["options"]
     assert o["temperature"] == 0.6 and o["top_p"] == 0.9 and o["top_k"] == 40 and o["repeat_penalty"] == 1.1
-    assert o["num_ctx"] == 8192 and o["num_predict"] == 512
+    assert o["num_ctx"] == 6144 and o["num_predict"] == 512 and "num_gpu" not in o
 
 
 def test_budget_keeps_system_prompt_and_trims_old_history():
@@ -70,7 +70,8 @@ def test_budget_keeps_system_prompt_and_trims_old_history():
     total = sum(L.est_tokens(m["content"]) for m in msgs) + L.est_tokens(tools)
     assert msgs[0]["role"] == "system" and L.RU_RULE in msgs[0]["content"]
     assert msgs[1]["role"] == "user"                       # never starts with an assistant turn
-    assert msgs[-1]["content"] == "последний вопрос"
+    assert msgs[-1]["content"].endswith("\nпоследний вопрос") and msgs[-1]["content"].startswith("[Справка")
+    assert any(m["content"].endswith("\nпоследний вопрос") for m in c.history[-2:])
     assert total + c.num_predict <= c.num_ctx              # Ollama will not truncate on its own
     assert len(msgs) < 81
 

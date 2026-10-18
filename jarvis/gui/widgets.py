@@ -190,7 +190,8 @@ class DiagnosticsDialog(QDialog):
 
     def _fix(self, fix_id: str) -> None:
         if fix_id.startswith("settings:"):
-            self.status.setText("Открой Настройки → Интеграции.")
+            tab = {"ai": "ИИ", "integrations": "Интеграции", "mic": "Микрофон"}.get(fix_id.split(":", 1)[1], "")
+            self.status.setText(f"Открой Настройки → {tab}." if tab else "Открой Настройки.")
             return
         if fix_id in self.actions:
             self.accept()

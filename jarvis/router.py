@@ -43,12 +43,48 @@ SKILLS = [
 ]
 
 
+# Second chance for the fast path: words that carry no command (mat, politeness, the name, filler)
+# and frequent Whisper misspellings. Used ONLY when the phrase as heard matched nothing, so a working
+# command is never changed by it.
+FILLER_ANY = {
+    "блин", "бля", "бл", "ска", "сцука", "сука", "блять", "блядь", "блиин", "нахрен", "нафиг", "нахер", "нахуй", "епта", "епт",
+    "ептить", "ебаный", "ебаное", "ебаную", "ебучий", "гребаный", "чертов", "черт", "пожалуйста", "пожалуйсто",
+    "плиз", "плз", "please", "слушай", "давай", "ка", "эй", "короче", "типа", "быстренько", "быстро", "срочно",
+    "джарвис", "джарвиз", "жарвис", "джервис", "джарвес", "jarvis", "братан", "бро", "дружище", "друг", "уже",
+    "мне", "ну", "ой", "ага",
+}
+FILLER_LEAD = {"а", "и", "так", "ладно", "окей", "ок", "хорошо", "слышь", "вот", "теперь", "щас", "сейчас"}
+TYPOS = {"скока": "сколько", "скоко": "сколько", "сколька": "сколько", "щас": "сейчас", "ща": "сейчас",
+         "счас": "сейчас", "щаc": "сейчас", "че": "что", "чо": "что", "громкасть": "громкость",
+         "граммкость": "громкость", "громкостью": "громкость", "ютюб": "ютуб", "ютубчик": "ютуб",
+         "музон": "музыку", "музончик": "музыку", "врубай": "включи", "вруби": "включи", "вырубай": "выключи",
+         "выруби": "выключи", "отруби": "выключи", "поставъ": "поставь", "таймэр": "таймер", "напомнить": "напомни"}
+_JOIN = {("по", "громче"): "погромче", ("по", "тише"): "потише", ("по", "тиши"): "потише",
+         ("по", "громчи"): "погромче", ("по", "тихше"): "потише"}
+
+
+def clean_command(t: str) -> str:
+    """normalize()d phrase -> the same command without filler/mat, with typos fixed ('' if nothing left)."""
+    words = [TYPOS.get(w, w) for w in t.split()]
+    joined: list[str] = []
+    for w in words:
+        if joined and (joined[-1], w) in _JOIN:
+            joined[-1] = _JOIN[(joined[-1], w)]
+        else:
+            joined.append(w)
+    out = [w for w in joined if w not in FILLER_ANY]
+    while out and out[0] in FILLER_LEAD:
+        out.pop(0)
+    return " ".join(out)
+
+
 class Router:
     def __init__(self, ctx: SkillContext):
         self.ctx = ctx
         self.skills: list[Skill] = []
         self.by_name: dict[str, Skill] = {}
         self.failed: dict[str, str] = {}
+        self.last_skill = ""                      # which skill answered the last phrase (timing log, tests)
         self.pending_confirm: Optional[Confirm] = None
         self.pending_expect: Optional[Callable[[str], ToolResult]] = None
         for section, module, cls in SKILLS:
@@ -104,18 +140,22 @@ class Router:
         return r
 
     def handle(self, text: str) -> Optional[ToolResult]:
+        self.last_skill = ""
         t = normalize(text)
         if not t:
             return None
         if self.pending_confirm:
             c, self.pending_confirm = self.pending_confirm, None
             if is_yes(t):
+                self.last_skill = "confirm"
                 return self._finalize(self._safe(c.on_yes))
             if is_no(t):
+                self.last_skill = "confirm"
                 return ToolResult(c.on_no_reply)
             # anything else: treat as a new command
         if self.pending_expect:
             cb, self.pending_expect = self.pending_expect, None
+            self.last_skill = "expect"
             return self._finalize(self._safe(lambda: cb(text)))
         # modal skills (dictation, translator) get every phrase first
         for skill in self.skills:
@@ -126,10 +166,22 @@ class Router:
                     log.exception("modal %s: %s", skill.name, e)
                     r = None
                 if r is not None:
+                    self.last_skill = skill.name
                     return self._finalize(r)
         notes = self.by_name.get("notes")
         if notes and getattr(notes, "awaiting", False):
+            self.last_skill = "notes"
             return notes.handle_dictation(text, t)  # type: ignore[attr-defined]
+        r = self._match(text, t)
+        if r is None:
+            cleaned = clean_command(t)
+            if cleaned and cleaned != t:
+                r = self._match(cleaned, cleaned)
+                if r is not None:
+                    log.debug("быстрый путь после очистки: %r -> %r", t, cleaned)
+        return self._finalize(r) if r is not None else None
+
+    def _match(self, text: str, t: str) -> Optional[ToolResult]:
         for skill in self.skills:
             try:
                 r = skill.match(text, t)
@@ -138,7 +190,8 @@ class Router:
                 continue
             if r is not None:
                 log.debug("-> %s", skill.name)
-                return self._finalize(r)
+                self.last_skill = skill.name
+                return r
         return None
 
     @staticmethod

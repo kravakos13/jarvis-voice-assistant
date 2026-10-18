@@ -341,6 +341,8 @@ class SettingsDialog(QDialog):
                   tip="По умолчанию 0: после ответа Джарвис засыпает до следующего «Джарвис»")
         self._add(f, "assistant.request_timeout_s", "После «Слушаю» ждать просьбу", "int", min=2, max=30, suffix=" с",
                   tip="Если за это время ничего не сказать, Джарвис молча засыпает")
+        self._add(f, "assistant.ack_after_s", "Сказать «Секунду», если ответ дольше", "float", min=0.0, max=10.0,
+                  step=0.5, decimals=1, suffix=" с", tip="0 — никогда")
         f2 = self._group(v, "Запуск")
         self._add(f2, "autostart.enabled", "Запускать вместе с Windows", "bool")
         self._add(f2, "gui.start_minimized", "Запускаться свёрнутым в трей", "bool")
@@ -408,7 +410,10 @@ class SettingsDialog(QDialog):
         self._add(f, "audio.silence_ms", "Пауза конца фразы", "int", min=300, max=3000, step=50, suffix=" мс")
         f2 = self._group(v, "Распознавание (Whisper)")
         self._add(f2, "stt.model", "Модель", "combo", options=WHISPER, tip="Больше = точнее и медленнее. small — оптимум")
-        self._add(f2, "stt.device", "Вычисления", "combo", options=[("auto", "Авто"), ("cuda", "Видеокарта (CUDA)"), ("cpu", "Процессор")])
+        self._add(f2, "stt.device", "Где работает распознавание", "combo",
+                  options=[("auto", "Авто (видеокарта, если есть)"), ("cuda", "Видеокарта (CUDA)"), ("cpu", "Процессор")],
+                  tip="Видеокарта: ~0,2–0,4 с на фразу и ~0,3 ГБ видеопамяти (small, int8_float16). "
+                      "Процессор: видеопамять свободна, ~0,6–1,5 с на фразу. Нужен перезапуск.")
         self._add(f2, "stt.compute_type", "Точность", "combo",
                   options=["auto", "float16", "int8_float16", "int8", "int8_float32", "float32"])
         f3 = self._group(v, "Активация и горячие клавиши")
@@ -445,6 +450,17 @@ class SettingsDialog(QDialog):
         self.pull_label = QLabel("")
         f.addRow(self.pull_label, self.pull_bar)
         self._model_combos = [main, self.fields["code.model"][0], self.fields["screen.vision_model"][0]]
+        self._add(f, "llm.placement", "Где работает ИИ", "combo",
+                  options=[("gpu", "Видеокарта (быстрее всего)"),
+                           ("cpu", "Оперативка (процессор) — видеопамять свободна"),
+                           ("auto", "Авто: видеокарта, в играх — оперативка")])
+        hint = QLabel("Видеокарта — ответ за 1–3 с. Оперативка освобождает видеопамять, но ИИ думает "
+                      "примерно в 3–5 раз медленнее (зависит от процессора). «Авто» в игровом режиме "
+                      "переносит ИИ в оперативку вместо полной выгрузки — Джарвис отвечает и в игре, "
+                      "только медленнее. Переключение применяется сразу (модель перезагрузится ~5–15 с).")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8fb3c8;")
+        f.addRow("", hint)
         f2 = self._group(v, "Поведение")
         self._add(f2, "llm.temperature", "Креативность", "slider", scale=(0.0, 1.5))
         self._add(f2, "llm.answer_length", "Длина ответов", "combo",
@@ -540,7 +556,9 @@ class SettingsDialog(QDialog):
         v = QVBoxLayout(w)
         f = self._group(v, "Игровой режим")
         self._add(f, "profiles.auto_game_mode", "Включать сам при полноэкранной игре / игре Steam", "bool")
-        self._add(f, "vram.release_in_game", "Освобождать видеопамять (выгрузить модели)", "bool")
+        self._add(f, "vram.release_in_game", "Освобождать видеопамять в игре", "bool",
+                  tip="ИИ на видеокарте — модель выгружается (ответ в игре медленный: загрузка заново). "
+                      "ИИ в режиме «Авто» — модель переезжает в оперативку и продолжает отвечать.")
         self._add(f, "vram.whisper_in_game", "Whisper в игре", "combo", options=[("cpu", "Перевести на процессор"),
                                                                                     ("unload", "Выгрузить")])
         self._add(f, "profiles.game_reminders_voice", "Напоминания вслух", "bool")

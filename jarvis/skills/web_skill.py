@@ -24,7 +24,7 @@ class WebSkill(Skill):
             if ans.sources and self.ctx.extra.get("on_sources"):
                 self.ctx.extra["on_sources"]([(x.title, x.url) for x in ans.sources[:5]])
             return ans.answer
-        return ToolResult("Секунду, гляну в интернете.", then=work)
+        return ToolResult("", then=work)   # «Секунду» comes from the assistant only if it takes > ack_after_s
 
     def match(self, text: str, t: str) -> Optional[ToolResult]:
         if re.match(r"^(загугли|погугли)\b|в гугле|в яндексе|на ютуб", t):

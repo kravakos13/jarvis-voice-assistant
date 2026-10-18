@@ -29,13 +29,14 @@ DEFAULTS: dict[str, Any] = {
     "assistant": {"name": "Джарвис", "user_name": "Флоки", "mode": "wake", "wake_reply": "Слушаю",
                   "greeting": "{hello}, мистер {user_name}, чего желаете?", "greeting_time_of_day": False,
                   "greet_on_start": True, "follow_up_seconds": 0, "extra_wake_words": [],
-                  "request_timeout_s": 6, "request_silence_ms": 1200, "max_request_s": 15, "tts_tail_ms": 500},
+                  "request_timeout_s": 6, "request_silence_ms": 1200, "max_request_s": 15, "tts_tail_ms": 500,
+                  "ack_after_s": 2.5},
     "stt": {"model": "small", "device": "auto", "compute_type": "auto", "language": "ru", "beam_size": 1,
             "download_root": "models/whisper", "initial_prompt": "Джарвис, привет."},
     "audio": {"input_device": None, "output_device": None, "sample_rate": 16000, "vad": "webrtc",
               "vad_aggressiveness": 2, "energy_threshold": 0.015, "frame_ms": 30, "silence_ms": 800,
               "min_speech_ms": 250, "max_utterance_s": 15, "pre_roll_ms": 300},
-    "llm": {"host": "http://localhost:11434", "model": "qwen2.5:7b", "temperature": 0.6, "num_ctx": 8192,
+    "llm": {"host": "http://localhost:11434", "model": "qwen2.5:7b", "temperature": 0.6, "num_ctx": 6144, "placement": "gpu",
             "num_predict": 512, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.1,
             "max_history_messages": 16, "timeout_s": 120, "keep_alive": "30m", "aux_keep_alive": "1m",
             "tool_calling": True, "system_prompt": DEFAULT_SYSTEM_PROMPT},
@@ -74,7 +75,7 @@ def _read_yaml(path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 REMOVED_SECTIONS = ("whatsapp", "comfyui", "faceswap", "video")
 
 
@@ -115,6 +116,12 @@ def migrate_local(data) -> tuple[dict, bool]:
         if isinstance(a, dict) and str(a.get("follow_up_seconds", "")).strip() in ("6", "6.0"):
             a.pop("follow_up_seconds")            # old default pinned by Settings -> new default 0 (off)
         data["config_version"] = 4
+        changed = True
+    if ver < 5:                                   # 1.0.5: 8192 context did not fit next to Whisper in 6 GB VRAM
+        llm5 = data.get("llm")
+        if isinstance(llm5, dict) and str(llm5.get("num_ctx", "")).strip() == "8192":
+            llm5.pop("num_ctx")                   # 1.0.4 default pinned by Settings -> 6144 (a user's own value is kept)
+        data["config_version"] = 5
         changed = True
     return data, changed
 

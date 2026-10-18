@@ -14,6 +14,8 @@ import datetime as _dt
 import json
 import logging
 import re
+import threading
+import time
 from typing import Iterator, Optional
 
 import requests
@@ -72,13 +74,34 @@ def est_tokens(obj) -> int:
     return len(text) // 3 + 4
 
 
+NOTE_PREFIX = "[Справка, не зачитывай: "
+_NOTE_RE = re.compile(r"^\[Справка, не зачитывай: .*?\]\n", re.S)
+
+
+def strip_note(text: str) -> str:
+    """User message without the context note (for summaries / display)."""
+    return _NOTE_RE.sub("", text or "", count=1)
+
+
+def _stats(data: dict) -> dict:
+    """Ollama's own timings (nanoseconds) -> seconds; tok_s = generation speed (low = model spilled to CPU)."""
+    ns = 1e9
+    ev, evd = int(data.get("eval_count") or 0), float(data.get("eval_duration") or 0)
+    return {"load_s": round(float(data.get("load_duration") or 0) / ns, 2),
+            "prompt_tokens": int(data.get("prompt_eval_count") or 0),
+            "prompt_s": round(float(data.get("prompt_eval_duration") or 0) / ns, 2),
+            "eval_tokens": ev, "eval_s": round(evd / ns, 2),
+            "tok_s": round(ev / (evd / ns), 1) if evd else 0.0,
+            "total_s": round(float(data.get("total_duration") or 0) / ns, 2)}
+
+
 class OllamaChat:
     def __init__(self, cfg: dict, session: Optional[requests.Session] = None):
         self.host = str(cfg.get("host", "http://localhost:11434")).rstrip("/")
         self.model = cfg.get("model", "qwen2.5:7b")
         self.system_prompt = cfg.get("system_prompt", "")
         self.temperature = float(cfg.get("temperature", 0.6))
-        self.num_ctx = max(2048, int(cfg.get("num_ctx", 8192)))
+        self.num_ctx = max(2048, int(cfg.get("num_ctx", 6144)))
         self.num_predict = int(cfg.get("num_predict", 512))          # voice answers are short
         self.top_p = float(cfg.get("top_p", 0.9))
         self.top_k = int(cfg.get("top_k", 40))
@@ -88,6 +111,11 @@ class OllamaChat:
         self.keep_alive = cfg.get("keep_alive", "30m")
         # extra models (coder, vision) are unloaded quickly to fit into 6 GB VRAM
         self.aux_keep_alive = cfg.get("aux_keep_alive", "1m")
+        # where the model runs: "gpu" (fastest), "cpu" (num_gpu=0: frees VRAM, ~3-5x slower), "auto" (GPU; CPU in games)
+        self.placement = str(cfg.get("placement", "gpu") or "gpu").lower()
+        self.on_cpu = self.placement == "cpu"
+        self.last_stats: dict = {}                 # Ollama timings of the last request (load / prompt / eval)
+        self.warm_tools: Optional[list] = None     # tool schemas used for warm-ups (set by the assistant)
         self.http = session or requests.Session()
         self.history: list[dict] = []
         # optional hook: fn(user_text) -> extra context for the system prompt (long-term memory)
@@ -115,20 +143,37 @@ class OllamaChat:
         self.history.clear()
 
     def _system_message(self) -> dict:
+        """STATIC system prompt (changes at most once a day). Ollama/llama.cpp reuse the evaluated prompt
+        prefix (system + tool schemas, ~2-2.5k tokens) between requests only while it stays byte-identical,
+        so the clock and memory hits go into the last user message instead (see _turn_context)."""
         now = _dt.datetime.now()
-        stamp = (f"Сейчас {_RU_WEEKDAYS[now.weekday()]}, {now.day} {_RU_MONTHS_GEN[now.month - 1]} "
-                 f"{now.year} года, {now:%H:%M}.")
-        extra = ""
+        stamp = f"Сегодня {_RU_WEEKDAYS[now.weekday()]}, {now.day} {_RU_MONTHS_GEN[now.month - 1]} {now.year} года."
+        content = f"{self.system_prompt}\n\n{stamp}\n\n{RU_RULE}"   # RU_RULE last: survives custom prompts
+        return {"role": "system", "content": content}
+
+    def _turn_context(self) -> str:
+        now = _dt.datetime.now()
+        parts = [f"Сейчас {now:%H:%M}."]
         if self.context_provider and self._last_user_text:
             try:
                 extra = self.context_provider(self._last_user_text) or ""
             except Exception as e:  # memory must never break the chat
                 log.debug("context_provider: %s", e)
-        content = f"{self.system_prompt}\n\n{stamp}"
-        if extra:
-            content += f"\n\n{extra}"
-        content += f"\n\n{RU_RULE}"            # always last: survives custom prompts, strongest position
-        return {"role": "system", "content": content}
+                extra = ""
+            if extra:
+                parts.append(extra)
+        return " ".join(parts)
+
+    def _messages(self, system: dict, tools: Optional[list]) -> list[dict]:
+        """system + fitted history. The per-turn context note is attached to the newest user message
+        IN the stored history, so every later request repeats the exact same tokens and Ollama only has
+        to evaluate what is new (the reply it generated itself is already in its cache)."""
+        for m in reversed(self.history):
+            if m.get("role") == "user":
+                if not m["content"].startswith(NOTE_PREFIX):
+                    m["content"] = f"{NOTE_PREFIX}{self._turn_context()}]\n{m['content']}"
+                break
+        return [system] + self._fit(system, tools)
 
     def options(self, temperature: Optional[float] = None, num_ctx: Optional[int] = None,
                 num_predict: Optional[int] = None) -> dict:
@@ -137,7 +182,58 @@ class OllamaChat:
              "num_ctx": num_ctx or self.num_ctx}
         if num_predict:
             o["num_predict"] = num_predict
+        if self.on_cpu:
+            o["num_gpu"] = 0                        # all layers in RAM: VRAM stays free (games), slower
         return o
+
+    def set_on_cpu(self, on_cpu: bool, warm_tools: Optional[list] = None) -> bool:
+        """Move the model between GPU and RAM. Ollama reloads it when num_gpu changes; warm it right away
+        (in the background) so the next command does not pay the reload. Returns True if it changed."""
+        if bool(on_cpu) == self.on_cpu:
+            return False
+        self.on_cpu = bool(on_cpu)
+        log.info("ИИ теперь работает на %s", "процессоре (оперативка)" if self.on_cpu else "видеокарте")
+        threading.Thread(target=self.warm, args=(warm_tools or self.warm_tools,), daemon=True, name="llm-warm").start()
+        return True
+
+    def warm(self, tools: Optional[list] = None) -> Optional[float]:
+        """Load the model and pre-evaluate the static prefix (system + tools) so the first real command
+        is fast. Returns seconds, None on failure (never raises)."""
+        t0 = time.monotonic()
+        try:
+            system = self._system_message()
+            payload: dict = {"model": self.model, "stream": False, "keep_alive": self.keep_alive,
+                             "messages": [system, {"role": "user", "content": "Привет"}],
+                             "options": self.options(num_predict=1)}
+            if tools:
+                payload["tools"] = tools
+            r = self.http.post(f"{self.host}/api/chat", json=payload, timeout=max(self.timeout, 300))
+            if r.status_code != 200:
+                log.info("Прогрев модели: Ollama %s %s", r.status_code, r.text[:120])
+                return None
+            self.last_stats = _stats(r.json())
+            dt = time.monotonic() - t0
+            log.info("Модель %s прогрета за %.1f с (загрузка %.1f с, промпт %d ток. за %.1f с)", self.model, dt,
+                     self.last_stats.get("load_s", 0), self.last_stats.get("prompt_tokens", 0),
+                     self.last_stats.get("prompt_s", 0))
+            return dt
+        except Exception as e:
+            log.info("Прогрев модели не удался: %s", e)
+            return None
+
+    def placement_info(self) -> Optional[dict]:
+        """What Ollama really did: {'model', 'size_gb', 'vram_gb', 'gpu_share'} from /api/ps (None if unknown).
+        gpu_share < 1 means part of the model spilled to RAM/CPU (much slower)."""
+        try:
+            ps = self.http.get(f"{self.host}/api/ps", timeout=3).json()
+        except Exception:
+            return None
+        for m in ps.get("models", []) or []:
+            if (m.get("name") or m.get("model") or "").split(":")[0] == self.model.split(":")[0]:
+                size, vram = float(m.get("size") or 0), float(m.get("size_vram") or 0)
+                return {"model": m.get("name"), "size_gb": round(size / 1e9, 2), "vram_gb": round(vram / 1e9, 2),
+                        "gpu_share": round(vram / size, 2) if size else 0.0}
+        return None
 
     def _trim(self) -> None:
         if self.max_history > 0 and len(self.history) > self.max_history:
@@ -146,10 +242,11 @@ class OllamaChat:
         while self.history and self.history[0]["role"] != "user":
             self.history.pop(0)
 
-    def _fit(self, system: dict, tools: Optional[list]) -> list[dict]:
+    def _fit(self, system: dict, tools: Optional[list], reserve: int = 0) -> list[dict]:
         """Drop the oldest turns until system + tools + history + answer fit into num_ctx (with margin), so
         Ollama never truncates the prompt itself (which loses the system prompt / Russian rule)."""
-        budget = self.num_ctx - self.num_predict - 256 - est_tokens(system["content"]) - (est_tokens(tools) if tools else 0)
+        budget = (self.num_ctx - self.num_predict - 256 - reserve - est_tokens(system["content"])
+                  - (est_tokens(tools) if tools else 0))
         hist = list(self.history)
         dropped = 0
         while len(hist) > 1 and sum(est_tokens(m.get("content", "")) for m in hist) > budget:
@@ -197,7 +294,7 @@ class OllamaChat:
         system = self._system_message()
         payload = {
             "model": self.model,
-            "messages": [system] + self._fit(system, tools),
+            "messages": self._messages(system, tools),
             "stream": True,
             "keep_alive": self.keep_alive,
             "options": self.options(num_predict=self.num_predict),
@@ -218,6 +315,8 @@ class OllamaChat:
                         except ValueError:
                             args = {}
                     calls.append({"name": fn.get("name", ""), "arguments": args})
+                if data.get("done"):
+                    self.last_stats = _stats(data)
                 piece = msg.get("content", "")
                 if piece:
                     parts.append(piece)
@@ -256,7 +355,7 @@ class OllamaChat:
                 has_cjk(self.history[-1]["content"]) or not_russian(self.history[-1]["content"])):
             self.history.pop()                       # never keep (or learn from) the drifted answer
         system = self._system_message()
-        msgs = [system] + self._fit(system, None) + [{"role": "user", "content": CORRECTION}]
+        msgs = self._messages(system, None) + [{"role": "user", "content": CORRECTION}]
         out = self.complete(msgs, temperature=0.3, lang="ru", _ru_rule=False)
         out = out or "Извини, сбился. Повтори, пожалуйста."
         self.history.append({"role": "assistant", "content": out})
@@ -297,12 +396,14 @@ class OllamaChat:
 
     def _complete_once(self, messages: list[dict], model: Optional[str], fmt: Optional[str],
                        temperature: Optional[float], num_ctx: Optional[int], timeout: Optional[float]) -> str:
+        main = (model or self.model) == self.model
         payload = {
             "model": model or self.model,
             "messages": messages,
             "stream": False,
-            "keep_alive": self.keep_alive if (model or self.model) == self.model else self.aux_keep_alive,
-            "options": self.options(temperature, num_ctx),
+            "keep_alive": self.keep_alive if main else self.aux_keep_alive,
+            # a different num_ctx would make Ollama RELOAD the main model (seconds) -> always the same one
+            "options": self.options(temperature, None if main else num_ctx),
         }
         if fmt:
             payload["format"] = fmt
@@ -312,10 +413,16 @@ class OllamaChat:
             raise LLMError(f"Ошибка связи с Ollama: {e}") from e
         if r.status_code != 200:
             raise LLMError(f"Ollama вернула {r.status_code}: {r.text[:300]}")
+        if not main and not self.on_cpu:
+            # coder / other model on a 6 GB card pushed the main model out: bring it back in the background
+            threading.Thread(target=self.warm, args=(self.warm_tools,), daemon=True, name="llm-rewarm").start()
         return strip_think((r.json().get("message") or {}).get("content", "")).strip()
 
     def embed(self, texts: list[str], model: str = "nomic-embed-text") -> list[list[float]]:
-        r = self.http.post(f"{self.host}/api/embed", json={"model": model, "input": texts, "keep_alive": "5m"}, timeout=60)
+        # num_gpu=0: the small embedding model runs on the CPU (~0.1 s) and never pushes the main model out
+        # of 6 GB VRAM (Ollama evicts a loaded model when a new one does not fit -> multi-second reload)
+        r = self.http.post(f"{self.host}/api/embed", json={"model": model, "input": texts, "keep_alive": self.keep_alive,
+                                                           "options": {"num_gpu": 0}}, timeout=60)
         if r.status_code != 200:
             raise LLMError(f"embed {r.status_code}: {r.text[:200]}")
         return r.json().get("embeddings") or []
@@ -377,10 +484,14 @@ class SentenceSplitter:
 
     _END_RE = re.compile(r"([.!?…。！？]+[\"»)」]?)(\s+|$)?")
 
-    def __init__(self, min_chars: int = 12, max_chars: int = 220):
+    def __init__(self, min_chars: int = 12, max_chars: int = 220, first_clause: int = 70):
         self.buf = ""
         self.min_chars = min_chars
         self.max_chars = max_chars
+        # latency: a long FIRST sentence is cut at a comma after ~40 chars once 70 have arrived,
+        # so the voice starts while the model is still writing the rest (0 = off)
+        self.first_clause = first_clause
+        self._emitted = 0
         self._in_think = False
 
     def feed(self, piece: str) -> list[str]:
@@ -398,6 +509,10 @@ class SentenceSplitter:
                 if m.end(1) >= self.min_chars and (m.group(2) or m.group(1)[-1] in "。！？」"):
                     cut = m.end(1)
                     break
+            if cut is None and not self._emitted and self.first_clause and len(self.buf) > self.first_clause:
+                idx = self.buf.find(", ", 40)
+                if 0 < idx < self.first_clause:
+                    cut = idx + 1
             if cut is None and len(self.buf) > self.max_chars:
                 idx = max(self.buf.rfind(",", 0, self.max_chars), self.buf.rfind(" ", 0, self.max_chars))
                 cut = idx + 1 if idx > 0 else self.max_chars
@@ -406,6 +521,7 @@ class SentenceSplitter:
             sentence, self.buf = self.buf[:cut].strip(), self.buf[cut:]
             if sentence:
                 out.append(sentence)
+                self._emitted += 1
         return out
 
     def flush(self) -> list[str]:

@@ -11,7 +11,23 @@ from .base import Skill, ToolResult, fn, s
 ADD_RE = re.compile(r"^(?:напомни|поставь напоминание|добавь задачу|добавь в план\w*|запланируй|создай задачу|создай напоминание|новая задача)\b")
 LIST_RE = re.compile(r"\b(какие|мои|список|что у меня|покажи|прочитай|расскажи)\b.*\b(задач\w*|дел\w*|план\w*|напоминани\w*|на сегодня|на завтра)\b|^что у меня (на )?(сегодня|завтра)")
 DONE_RE = re.compile(r"\b(отметь|выполнил\w*|сделал\w*|готово|заверши|закрой)\b.*\bзадач\w*|\bзадач\w* .*\b(выполнен\w*|сделан\w*)")
+ALARM_RE = re.compile(r"^(?:поставь|заведи|установи|включи|сделай|создай)\s+(?:мне\s+)?будильник\w*\s*(.*)$"
+                      r"|^разбуди\s+(?:меня\s+)?(.+)$|^будильник\s+(?:на\s+)?(.+)$")
 DEL_RE = re.compile(r"^(?:удали|убери|отмени)\s+(?:задачу|напоминание)\b(.*)$")
+
+
+def alarm_phrase(when: str) -> str:
+    """'на 7' / 'в 6:30' / 'завтра на 7 утра' -> a planner phrase 'напомни … будильник'.
+    A bare hour up to 11 means the morning (nobody sets an alarm for 7 pm by saying 'на 7')."""
+    w = re.sub(r"\b(\d{1,2})[ .:-](\d{2})\b", r"\1:\2", when.strip())     # normalize() turned 6:30 into "6 30"
+    w = re.sub(r"^на\s+", "в ", w)
+    w = re.sub(r"\bна (\d)", r"в \1", w)
+    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\b", w)
+    if m and not re.search(r"утр|вечер|дня|ночи|через", w) and int(m.group(1)) <= 11:
+        w = w[:m.end()] + " утра" + w[m.end():]
+    if not re.match(r"^(в|во|завтра|сегодня|через|послезавтра|утром|вечером)\b", w):
+        w = "в " + w
+    return f"напомни {w} будильник"
 
 
 class PlannerSkill(Skill):
@@ -39,6 +55,15 @@ class PlannerSkill(Skill):
             return ToolResult(f"Записал задачу номер {t.id}: {p.text}. Напомню {human_dt(p.due)}.")
         return ToolResult(f"Записал задачу номер {t.id}: {p.text}. Без времени, просто в список.")
 
+    def alarm(self, when: str) -> ToolResult:
+        p = parse_task(alarm_phrase(when)) if when.strip() else None
+        if p is None:
+            return ToolResult("На какое время поставить будильник? Скажи, например: «поставь будильник на 7 утра».")
+        if p.due is None:
+            return ToolResult("На какое время поставить будильник? Скажи, например: «поставь будильник на 7 утра».")
+        self.planner.add("Будильник", p.due)
+        return ToolResult(f"Будильник поставил: {human_dt(p.due)}.")
+
     def list_reply(self, t: str) -> ToolResult:
         today = _dt.date.today()
         if "завтра" in t:
@@ -55,6 +80,9 @@ class PlannerSkill(Skill):
         return ToolResult(f"Всего открытых задач: {len(tasks)}. " + "; ".join(parts) + ".")
 
     def match(self, text: str, t: str) -> Optional[ToolResult]:
+        m = ALARM_RE.match(t)
+        if m:
+            return self.alarm(next((g for g in m.groups() if g), ""))
         m = DEL_RE.match(t)
         if m:
             task = self.planner.find(m.group(1))

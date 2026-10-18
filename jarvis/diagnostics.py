@@ -213,11 +213,41 @@ def _modules(assistant) -> list[Check]:
                   "Отключён: " + explain_failure(v)) for k, v in failed.items()]
 
 
+def _speed(cfg, assistant) -> list[Check]:
+    """Where the model really runs (Ollama /api/ps) + measured latency of recent commands."""
+    out: list[Check] = []
+    llm = getattr(assistant, "llm", None)
+    if llm is not None:
+        info = llm.placement_info()
+        if getattr(llm, "on_cpu", False):
+            out.append(Check("llm_place", "ИИ: где работает", None,
+                             "В оперативке (процессор) — видеопамять свободна, ответы в 3–5 раз медленнее.",
+                             [("settings:ai", "Где работает ИИ")]))
+        elif info is None:
+            out.append(Check("llm_place", "ИИ: где работает", None, "Модель ещё не загружена (загрузится при первом вопросе)."))
+        elif info["gpu_share"] >= 0.98:
+            out.append(Check("llm_place", "ИИ: где работает", True,
+                             f"Целиком на видеокарте ({info['vram_gb']:.1f} ГБ видеопамяти)."))
+        else:
+            pct = round(info["gpu_share"] * 100)
+            out.append(Check("llm_place", "ИИ: где работает", None,
+                             f"Модель не влезла в видеопамять: на видеокарте {pct}%, остальное на процессоре — "
+                             "ответы медленнее. Помогает: Whisper на процессор (Настройки → Микрофон), "
+                             "меньше контекст (llm.num_ctx: 4096), закрыть программы, занимающие видеопамять.",
+                             [("settings:ai", "Настройки ИИ")]))
+    timings = getattr(assistant, "timings", None)
+    rep = timings.report() if timings is not None else None
+    if rep:
+        out.append(Check("speed", "Скорость ответа", True, rep))
+    return out
+
+
 def run(cfg: dict, assistant=None, quick: bool = False) -> list[Check]:
     checks: list[Check] = []
     for fn in (lambda: [_mic(cfg, quick)], lambda: [_whisper(cfg, assistant, quick)], lambda: _ollama(cfg),
                lambda: [_piper(cfg, quick)], lambda: [_output(cfg)], lambda: [_internet()],
-               lambda: [_alerts(cfg, assistant)], lambda: [_telegram(cfg)], lambda: _modules(assistant)):
+               lambda: [_alerts(cfg, assistant)], lambda: [_telegram(cfg)], lambda: _modules(assistant),
+               lambda: _speed(cfg, assistant)):
         try:
             checks += [c for c in fn() if c is not None]
         except Exception as e:      # a diagnostic must never crash
