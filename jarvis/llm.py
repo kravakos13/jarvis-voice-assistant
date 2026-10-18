@@ -45,13 +45,14 @@ class OllamaChat:
             r = self.http.get(f"{self.host}/api/tags", timeout=5)
             r.raise_for_status()
         except requests.RequestException:
-            return False, (f"Не могу подключиться к Ollama по адресу {self.host}. "
-                           "Запусти Ollama (значок в трее или команда `ollama serve`).")
+            from .ollama_setup import friendly_error
+            return False, friendly_error({"llm": {"host": self.host}}, session=self.http)
         names = [m.get("name", "") for m in r.json().get("models", [])]
         wanted = self.model if ":" in self.model else self.model + ":latest"
         if wanted not in names and self.model not in names:
-            return False, (f"Модель '{self.model}' не скачана. Выполни: ollama pull {self.model}"
-                           + (f" (сейчас есть: {', '.join(names)})" if names else ""))
+            return False, (f"Модель ИИ «{self.model}» ещё не скачана. Джарвис предложит скачать её в окне, или: "
+                           "Пуск → Джарвис → «Докачать компоненты»"
+                           + (f" (сейчас есть: {', '.join(names)})" if names else "") + ".")
         return True, "ok"
 
     def reset(self) -> None:

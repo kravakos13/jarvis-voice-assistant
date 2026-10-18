@@ -489,6 +489,50 @@ class Controller(QObject):
                 self.emit_from_thread("notice", text=msg)
         threading.Thread(target=work, daemon=True).start()
 
+    def ollama_flow(self, state: str, models: Optional[list] = None, ask: bool = True) -> None:
+        """Ollama is missing / stopped / lacks models: offer to fix it right here, with progress in the window."""
+        from .. import ollama_setup as osu
+        if self.demo or getattr(self, "_ollama_busy", False):
+            return
+        oc = self.cfg.get("ollama") or {}
+        models = models or []
+        if state == "missing":
+            if not oc.get("offer_install", True) and ask:
+                return
+            q = ("Ollama — локальный ИИ, без которого Джарвис не может отвечать, — не установлена.\n\n"
+                 "Установить её сейчас? Скачается около 1,6 ГБ, права администратора не нужны, 5–20 минут. "
+                 "Потом докачается модель ИИ (около 4,7 ГБ).")
+        elif state == "running" and models:
+            q = f"Не скачаны модели ИИ: {', '.join(models)} (основная — около 4,7 ГБ).\n\nСкачать сейчас?"
+        elif state == "stopped":
+            q = "Ollama установлена, но не запустилась.\n\nПопробовать запустить её ещё раз?"
+        else:
+            return
+        if ask and QMessageBox.question(self.window, "Ollama", q) != QMessageBox.StandardButton.Yes:
+            self.window.add_message("Система", osu.friendly_error(self.cfg, state) if state != "running"
+                                    else "Модели можно скачать позже: «проверь себя» → «Скачать».")
+            return
+        self._ollama_busy = True
+        self.window.add_message("Система", "Готовлю Ollama… Прогресс — над полем ввода.")
+
+        def prog(label: str, pct: Optional[int]) -> None:
+            self.emit_from_thread("progress", value=pct if pct is not None else 0, label=label)
+
+        def work():
+            try:
+                ok, msg = osu.ensure(self.cfg, progress=prog, allow_install=(state == "missing"))
+                if ok and self.assistant is not None:
+                    self.assistant.recheck_llm()
+                text = f"Готово: {msg} Можно говорить." if ok else msg
+            except Exception as e:
+                log.exception("ollama flow: %s", e)
+                text = f"Не получилось подготовить Ollama: {e}"
+            finally:
+                self._ollama_busy = False
+            self.emit_from_thread("progress", value=100)
+            self.emit_from_thread("notice", text=text)
+        threading.Thread(target=work, name="jarvis-ollama-setup", daemon=True).start()
+
     def connect_google(self) -> None:
         """Interactive Google sign-in in the browser (in a thread); result goes to the chat."""
         from .. import google_auth as ga
@@ -596,7 +640,8 @@ class Controller(QObject):
             self.window.add_message("Система", "При запуске найдены проблемы: " + "; ".join(
                 f"{c['title']} — {c['detail']}" for c in bad) + ". Меню ⋯ → Самодиагностика.")
             return
-        dlg = DiagnosticsDialog(checks, self.cfg, rerun=self.run_diagnostics, parent=self.window)
+        dlg = DiagnosticsDialog(checks, self.cfg, rerun=self.run_diagnostics, parent=self.window,
+                                actions={"install_ollama": lambda: self.ollama_flow("missing", ask=False)})
         dlg.show()
         self._diag_dlg = dlg
 
@@ -701,6 +746,8 @@ class Controller(QObject):
             w.add_message("Источники", "", data.get("links", []))
         elif event == "notice":
             w.add_message("Система", data.get("text", ""))
+        elif event == "ollama_problem":
+            QTimer.singleShot(500, lambda: self.ollama_flow(data.get("state", ""), data.get("models") or []))
         elif event == "open_settings":
             tab = data.get("tab")
             QTimer.singleShot(300, lambda: self.open_settings(tab=tab))

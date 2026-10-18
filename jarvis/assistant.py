@@ -71,10 +71,7 @@ class Assistant:
         self._compose_prompt()
         self.profile = "work"
         self.profile_auto = False
-        self.llm_ok, msg = self.llm.check()
-        if not self.llm_ok:
-            log.warning(msg)
-            self.emit("notice", text=msg)
+        self.llm_ok, msg = self._ensure_ollama()
 
         self.speaker = None
         if speak:
@@ -118,6 +115,28 @@ class Assistant:
         self._brain.start()
         self._ptt_active = threading.Event()
         self._turns = 0
+
+    def _ensure_ollama(self) -> tuple[bool, str]:
+        """Start an installed-but-stopped Ollama (hidden, waits up to ollama.start_timeout_s); report the rest.
+        The GUI gets an 'ollama_problem' event and offers to install Ollama / download the models."""
+        from . import ollama_setup as osu
+        oc = self.cfg.get("ollama") or {}
+        host = osu.host_of(self.cfg)
+        if oc.get("auto_start", True) and not osu.is_running(host) and osu.is_local(host) and osu.find_exe():
+            self.emit("notice", text="Запускаю Ollama (локальный ИИ)…")
+            osu.start(self.cfg, wait=float(oc.get("start_timeout_s", 30)))
+        ok, msg = self.llm.check()
+        if not ok:
+            log.warning(msg)
+            self.emit("notice", text=msg)
+            state = osu.status(self.cfg)
+            models = osu.missing_models(self.cfg) if state == "running" else []
+            self.emit("ollama_problem", state=state, models=models, text=msg)
+        return ok, msg
+
+    def recheck_llm(self) -> bool:
+        self.llm_ok, _ = self.llm.check()
+        return self.llm_ok
 
     # ------------------------------------------------------------------ events / output
     def emit(self, event: str, **data) -> None:

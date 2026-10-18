@@ -256,6 +256,13 @@ files:                       # «найди файл отчёт»
   roots: ["~/Desktop", "~/Documents", "~/Downloads", "~/Pictures", "~/Videos", "D:/"]
   max_index: 300000
 
+ollama:                      # локальный ИИ; Джарвис сам запускает и (по твоему согласию) устанавливает Ollama
+  auto_start: true           # если Ollama установлена, но не запущена — запустить её скрыто при старте Джарвиса
+  start_tray_app: true       # сначала «ollama app.exe» (значок в трее, её же автозапуск), иначе «ollama serve»
+  start_timeout_s: 30        # сколько ждать, пока Ollama ответит
+  offer_install: true        # если Ollama нет — предложить установить (скачать ~1,6 ГБ)
+  setup_url: "https://ollama.com/download/OllamaSetup.exe"
+
 lumo:                        # «Передать Люмо» — облачный ассистент по почте; ТОЛЬКО по явной команде, с подтверждением
   enabled: true
   email_to: "lumo-jarvis@mail.grokbot.com"   # адрес Люмо; тема письма «[Джарвис] …»

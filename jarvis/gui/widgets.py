@@ -146,9 +146,11 @@ class DiagnosticsDialog(QDialog):
     """Russian report with fix-it buttons. checks: list of dicts (diagnostics.Check.__dict__)."""
     _done = Signal(str)
 
-    def __init__(self, checks: list, cfg: dict, rerun: Optional[Callable[[], None]] = None, parent=None):
+    def __init__(self, checks: list, cfg: dict, rerun: Optional[Callable[[], None]] = None, parent=None,
+                 actions: Optional[dict] = None):
         super().__init__(parent)
         self.cfg = cfg
+        self.actions = actions or {}         # fix_id -> callable handled by the main window (with progress)
         self.setWindowTitle("Самодиагностика")
         self.resize(560, 520)
         lay = QVBoxLayout(self)
@@ -188,6 +190,10 @@ class DiagnosticsDialog(QDialog):
     def _fix(self, fix_id: str) -> None:
         if fix_id.startswith("settings:"):
             self.status.setText("Открой Настройки → Интеграции.")
+            return
+        if fix_id in self.actions:
+            self.accept()
+            self.actions[fix_id]()
             return
         self.status.setText("Выполняю...")
 

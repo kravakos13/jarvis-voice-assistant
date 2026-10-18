@@ -2,7 +2,8 @@
 
   1. pip (get-pip.py) + Python packages from requirements.txt (or the bundled wheels\\ folder)
   2. Piper voice + Whisper model (scripts/download_models.py)
-  3. Ollama (silent install of OllamaSetup.exe if missing) + `ollama pull` of the configured models
+  3. Ollama via jarvis/ollama_setup.py: download OllamaSetup.exe (resume/retries) + silent install if missing,
+     start it hidden, pull missing models over the HTTP API (no PATH needed)
 
 Every step is logged to logs\\install.log; a failed step does not abort the others —
 the app's self-diagnostics ("проверь себя") offers to fix whatever is missing later.
@@ -11,18 +12,14 @@ Usage: python installer\\postinstall.py [--core-only] [--no-ollama] [--no-models
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PY = Path(sys.executable)
 LOG = ROOT / "logs" / "install.log"
-OLLAMA_URL = "https://ollama.com/download/OllamaSetup.exe"
 CORE = ["PyYAML>=6.0", "requests>=2.31", "numpy>=1.24", "psutil>=5.9", "keyring>=24", "dateparser>=1.2"]
 
 
@@ -72,69 +69,69 @@ def install_packages(core_only: bool) -> bool:
     return False
 
 
-def ollama_exe() -> str | None:
-    exe = shutil.which("ollama")
-    if exe:
-        return exe
-    cand = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe"
-    return str(cand) if cand.exists() else None
+def _progress():
+    """Console progress (the installer shows this window); the log gets every 10%."""
+    state = {"pct": -1, "label": ""}
+
+    def cb(label: str, pct) -> None:
+        if pct is None:
+            log(label)
+            return
+        try:
+            print(f"\r  {label} ({pct}%)   ", end="", flush=True)
+        except UnicodeEncodeError:
+            pass
+        if pct // 10 != state["pct"] // 10 or pct == 100:
+            with open(LOG, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}]   {label} ({pct}%)\n")
+        state["pct"] = pct
+    return cb
 
 
-def ensure_ollama() -> str | None:
-    exe = ollama_exe()
+def setup_ollama(no_install: bool = False, no_models: bool = False) -> bool:
+    """Install Ollama if missing (download with resume + silent setup), start it hidden, pull missing models."""
+    sys.path.insert(0, str(ROOT))
+    try:
+        from jarvis import ollama_setup as osu
+        from jarvis.config import load_config
+    except Exception as e:                       # packages not installed - the app will offer this later
+        log(f"[!] Модуль Ollama недоступен ({e}) — Джарвис предложит установить Ollama при запуске.")
+        return False
+    cfg = load_config()
+    prog = _progress()
+    exe = osu.find_exe()
     if exe:
         log(f"Ollama найдена: {exe}")
-        return exe
-    if sys.platform != "win32":
-        log("Ollama не найдена (не Windows) — пропускаю установку.")
-        return None
-    dst = ROOT / "cache" / "OllamaSetup.exe"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    log(f"Скачиваю Ollama: {OLLAMA_URL}")
-    try:
-        urllib.request.urlretrieve(OLLAMA_URL, dst)
-    except Exception as e:
-        log(f"  не удалось скачать Ollama: {e}")
-        return None
-    run([dst, "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES"])
-    try:
-        dst.unlink()
-    except OSError:
-        pass
-    return ollama_exe()
-
-
-def wait_ollama(exe: str) -> bool:
-    import requests
-    for i in range(40):
+    elif no_install:
+        log("Ollama не установлена (--no-ollama-install).")
+        return False
+    else:
+        log(f"Ollama не найдена — скачиваю {osu.OLLAMA_URL} (~1,6 ГБ, докачивается при обрыве)")
         try:
-            requests.get("http://localhost:11434/api/tags", timeout=2)
-            return True
-        except Exception:
-            if i == 0:
-                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                try:
-                    subprocess.Popen([exe, "serve"], creationflags=flags,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except OSError:
-                    pass
-            time.sleep(1.5)
-    return False
-
-
-def pull_models(exe: str) -> None:
-    sys.path.insert(0, str(ROOT))
-    from jarvis.config import load_config
-    cfg = load_config()
-    models = []
-    for m in (cfg["llm"].get("model"), (cfg.get("code") or {}).get("model"),
-              (cfg.get("memory") or {}).get("embed_model")):
-        if m and m not in models:
-            models.append(m)
-    for m in models:
-        log(f"Скачиваю модель {m} (может занять долго)...")
-        if run([exe, "pull", m]) != 0:
-            log(f"  модель {m} не скачалась — можно повторить: Настройки → О программе → Обновить модели")
+            exe = osu.install(cfg, prog)
+            print()
+            log(f"Ollama установлена: {exe}")
+        except osu.OllamaSetupError as e:
+            print()
+            log(f"[!] {e}")
+            log("    Джарвис предложит установить Ollama при запуске, или: Пуск → Джарвис → «Докачать компоненты».")
+            return False
+    if not osu.start(cfg, wait=60, progress=prog):
+        log("[!] " + osu.friendly_error(cfg))
+        return False
+    log("Ollama отвечает.")
+    if no_models:
+        return True
+    missing = osu.missing_models(cfg)
+    if not missing:
+        log("Модели ИИ уже скачаны.")
+        return True
+    log("Скачиваю модели ИИ: " + ", ".join(missing) + " (может занять долго)")
+    errs = osu.pull_missing(cfg, prog)
+    print()
+    for err in errs:
+        log(f"  модель не скачалась: {err} — Джарвис предложит докачать при запуске")
+    return not errs
 
 
 def main() -> int:
@@ -152,12 +149,11 @@ def main() -> int:
     if not a.no_models and not a.core_only:
         ok &= run([PY, ROOT / "scripts" / "download_models.py"]) == 0
     if not a.no_ollama and not a.core_only:
-        exe = ensure_ollama()
-        if exe and wait_ollama(exe):
-            pull_models(exe)
-        else:
+        try:
+            ok &= setup_ollama(no_models=a.no_models)
+        except Exception as e:                   # never abort the installer because of Ollama
             ok = False
-            log("[!] Ollama не готова — модели можно скачать позже (Настройки → О программе).")
+            log(f"[!] Ollama: {e}")
     log("=== Готово ===" if ok else "=== Готово с предупреждениями (см. выше) ===")
     return 0
 

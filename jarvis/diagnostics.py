@@ -4,11 +4,9 @@ run(cfg, assistant, quick) -> list[Check]. Quick mode (startup) does no recordin
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -73,9 +71,13 @@ def _ollama(cfg) -> list[Check]:
     try:
         tags = requests.get(f"{host}/api/tags", timeout=3).json()
     except Exception:
-        fixes = [("start_ollama", "Запустить Ollama")] if (shutil.which("ollama") or pu.IS_WIN) else []
-        return [Check("ollama", "Ollama (ИИ)", False, "Ollama не запущена или не установлена.",
-                      fixes + [("ollama_site", "Скачать Ollama")])]
+        from . import ollama_setup as osu
+        st = osu.status(cfg)
+        if st == "missing":
+            fixes = ([("install_ollama", "Установить Ollama")] if pu.IS_WIN else []) + [("ollama_site", "Сайт Ollama")]
+        else:
+            fixes = [("start_ollama", "Запустить Ollama")] if st == "stopped" else []
+        return [Check("ollama", "Ollama (ИИ)", False, osu.friendly_error(cfg, st), fixes)]
     have = {m.get("name", "") for m in tags.get("models", [])}
     have |= {n.split(":")[0] for n in have if n.endswith(":latest")}
     out = [Check("ollama", "Ollama (ИИ)", True, f"Работает, моделей: {len(tags.get('models', []))}")]
@@ -221,15 +223,14 @@ def spoken_summary(checks: list[Check]) -> str:
 def fix(fix_id: str, cfg: dict) -> str:
     """Run a fix-it action. Returns a human message."""
     if fix_id == "start_ollama":
-        exe = shutil.which("ollama")
-        app = Path(pu.os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama app.exe" if pu.IS_WIN else None
-        if app and app.exists():
-            pu.spawn([str(app)])
-        elif exe:
-            pu.spawn([exe, "serve"])
-        else:
+        from . import ollama_setup as osu
+        if not osu.find_exe():
             return "Ollama не установлена."
-        return "Запускаю Ollama..."
+        return "Ollama запущена." if osu.start(cfg) else osu.friendly_error(cfg)
+    if fix_id == "install_ollama":
+        from . import ollama_setup as osu
+        ok, msg = osu.ensure(cfg, allow_install=True)
+        return msg
     if fix_id.startswith("pull:"):
         from .updater import pull_models
         m = fix_id[5:]
