@@ -332,7 +332,24 @@ class Controller(QObject):
         self.window.lbl_mic.setText("🔇 микрофон выкл." if muted else "")
         if self.assistant and self.assistant.mic_muted != muted:
             threading.Thread(target=self.assistant.set_mic_muted, args=(muted,), daemon=True).start()
-        self.window.face.set_state("muted" if muted else "idle")
+        self.window.face.set_state("muted" if muted else self._rest_state())
+
+    def _rest_state(self) -> str:
+        """What the face shows between requests: asleep (waits for the name), PTT idle, or mic off."""
+        if self.assistant and self.assistant.mic_muted:
+            return "muted"
+        return "sleeping" if self.cfg["assistant"].get("mode", "wake") == "wake" else "idle"
+
+    TRAY_STATES = {"sleeping": "спит — скажи «{name}»", "listening": "слушает", "thinking": "думает",
+                   "speaking": "говорит", "muted": "микрофон на паузе", "idle": "ждёт (push-to-talk)",
+                   "loading": "загружается"}
+
+    def _tray_state(self, st: str) -> None:
+        name = self.cfg["assistant"].get("name", "Джарвис")
+        label = self.TRAY_STATES.get(st)
+        if label and getattr(self, "tray", None) is not None and getattr(self, "_tray_st", None) != st:
+            self._tray_st = st
+            self.tray.setToolTip(f"{name} — {label.format(name=name)}")
 
     def toggle_mic(self) -> None:
         self.set_muted(not (self.assistant.mic_muted if self.assistant else self.act_mute.isChecked()))
@@ -736,10 +753,11 @@ class Controller(QObject):
         name = self.cfg["assistant"].get("name", "Джарвис")
         if event == "state":
             st = data.get("state", "idle")
-            if self.assistant and self.assistant.mic_muted and st == "idle":
+            if self.assistant and self.assistant.mic_muted and st in ("idle", "sleeping"):
                 st = "muted"
-            if not (w.face.state == "speaking" and w.face.env and st in ("idle", "thinking")):
+            if not (w.face.state == "speaking" and w.face.env and st in ("idle", "sleeping", "thinking")):
                 w.face.set_state(st)
+            self._tray_state(st)
         elif event == "mic_level":
             w.face.set_mic_level(data.get("level", 0.0))
             if w.face.state == "idle" and data.get("level", 0) > 0.15 and not (self.assistant and self.assistant.mic_muted):
@@ -747,7 +765,7 @@ class Controller(QObject):
         elif event == "speech":
             w.face.speak(data.get("env", []), data.get("wid", []), data.get("dt", 0.02))
         elif event == "speech_end":
-            QTimer.singleShot(200, lambda: w.face.set_state("idle") if not w.face.env else None)
+            QTimer.singleShot(200, lambda: w.face.set_state(self._rest_state()) if not w.face.env else None)
         elif event == "user_text":
             w.add_message("Ты", data.get("text", ""))
         elif event == "assistant_text":

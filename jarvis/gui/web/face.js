@@ -11,7 +11,7 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
 THREE.ColorManagement.enabled = false;           // authored as display values
 const params = new URLSearchParams(location.search);
-const LABELS = { listening: 'СЛУШАЮ', thinking: 'ДУМАЮ', muted: 'МИКРОФОН ВЫКЛ', loading: 'ЗАГРУЗКА' };
+const LABELS = { sleeping: 'СПЛЮ', listening: 'СЛУШАЮ', thinking: 'ДУМАЮ', muted: 'МИКРОФОН ВЫКЛ', loading: 'ЗАГРУЗКА' };
 const S = {
   state: params.get('state') || 'loading', mic: 0, micS: 0,
   env: [], wid: [], envDt: 0.02, envStart: 0, mouth: 0, width: 0.5, forceMouth: undefined, forceWidth: undefined, lastT: null,

@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import queue
+import re
 import threading
 import time
 from typing import Callable, Optional
@@ -18,10 +19,11 @@ from typing import Callable, Optional
 import numpy as np
 
 from .config import PROJECT_ROOT
-from .llm import LLMError, OllamaChat, SentenceSplitter
+from .llm import LLMError, OllamaChat, SentenceSplitter, has_cjk, not_russian, strip_cjk
 from .router import Router
 from .skills.base import SkillContext, ToolResult
 from .wake import WakeWordDetector
+from .wakeflow import WakeFlow
 
 log = logging.getLogger("jarvis")
 
@@ -38,7 +40,16 @@ LENGTH_HINTS = {
 PROFILE_NAMES = {"work": "рабочий", "game": "игровой", "night": "ночной"}
 
 TOOL_HINT = ("\n\nУ тебя есть инструменты (функции). Вызывай их только когда пользователь явно просит что-то сделать "
-             "на компьютере, или нужна свежая информация из интернета. Для обычной болтовни инструменты не нужны.")
+             "на компьютере, или нужна свежая информация из интернета. Для обычной болтовни инструменты не нужны. "
+             "НИКОГДА не говори, что что-то сделал (закрыл, открыл, включил, выключил, отправил, удалил), если не "
+             "вызвал для этого инструмент — результат сообщит сам инструмент. Если подходящего инструмента нет, "
+             "честно скажи, что этого пока не умеешь.")
+# "I did it" narration: only allowed when a tool really ran
+CLAIM_RE = re.compile(r"^\W*(?:(?:хорошо|окей|ок|готово|сделано|есть|принято|понял)[,.!\s—-]*)?(?:сейчас\s+|уже\s+)?"
+                      r"(закрыл\w*|закрываю|закрыто|открыл\w*|открываю|запустил\w*|запускаю|включил\w*|включаю|"
+                      r"выключил\w*|выключаю|свернул\w*|сворачиваю|развернул\w*|отправил\w*|отправляю|удалил\w*|"
+                      r"удаляю|поставил\w*|ставлю|остановил\w*|переключил\w*|сделал\w*|готово|сделано)\b", re.I)
+HONEST_NO_TOOL = "Это я сделать не смог — такой команды у меня пока нет. Скажи по-другому или сделай вручную."
 
 
 def greeting_text(a: dict, now: Optional[_dt.datetime] = None) -> str:
@@ -405,27 +416,60 @@ class Assistant:
         return self._chat(text)
 
     def _chat(self, text: str) -> Optional[str]:
+        """Stream the LLM answer sentence by sentence to TTS, with two guards:
+        * language: a sentence with CJK (or an English first sentence) is never spoken — the stream is
+          abandoned and the answer regenerated once in Russian (llm.regenerate_russian), CJK stripped last;
+        * false success: an "I closed/opened/…" sentence is held back while tools are offered; if no tool was
+          actually called it is replaced with an honest "не смог", if a tool ran its own (verified) reply is used."""
         splitter = SentenceSplitter()
         tools = self.router.tool_schemas() if self.tool_calling else None
         calls: list = []
         print(f"{self.name}: ", end="", flush=True)
-        full = []
-        try:
-            for piece in self.llm.stream(text, tools=tools, tool_calls_out=calls):
-                full.append(piece)
-                print(piece, end="", flush=True)
-                self.emit("assistant_partial", text=piece)
-                if self.speaker:
-                    for sentence in splitter.feed(piece):
-                        self.speaker.say(sentence)
-                if self.stop_event.is_set():
-                    break
-            print()
+        spoken: list[str] = []
+        held: list[str] = []
+        drift = False
+
+        def out(sentence: str) -> bool:
+            """False = drift detected (stop the stream)."""
+            nonlocal drift
+            if has_cjk(sentence) or (not spoken and not held and not_russian(sentence)):
+                drift = True
+                return False
+            if tools and not spoken and (held or CLAIM_RE.match(sentence)):
+                held.append(sentence)                  # wait: did a tool really run?
+                return True
+            spoken.append(sentence)
+            print(sentence, end=" ", flush=True)
+            self.emit("assistant_partial", text=sentence + " ")
             if self.speaker:
-                for sentence in splitter.flush():
-                    self.speaker.say(sentence)
-            if full:
-                self.emit("assistant_done", text="".join(full))
+                self.speaker.say(sentence)
+            return True
+        try:
+            stream = self.llm.stream(text, tools=tools, tool_calls_out=calls)
+            for piece in stream:
+                if any(not out(sn) for sn in splitter.feed(piece)) or self.stop_event.is_set():
+                    break
+            else:
+                for sn in splitter.flush():
+                    if not out(sn):
+                        break
+            if drift:
+                close = getattr(stream, "close", None)
+                if close:
+                    close()                                # abandon the drifting stream (history keeps the user msg)
+                log.warning("LLM: ответ уходит не на русский язык — переспрашиваю по-русски")
+                calls.clear()
+                held.clear()
+                fixed = strip_cjk(self.llm.regenerate_russian())
+                if spoken and fixed.startswith(" ".join(spoken)[:20]):
+                    fixed = fixed[len(" ".join(spoken)):].strip()
+                if fixed:
+                    spoken.append(fixed)
+                    print(fixed, end="", flush=True)
+                    self.emit("assistant_partial", text=fixed)
+                    if self.speaker:
+                        self.speaker.say(fixed)
+            print()
         except LLMError as e:
             print()
             log.error("%s", e)
@@ -437,6 +481,15 @@ class Assistant:
             else:
                 self.say("Языковая модель не отвечает. Проверь, что Ollama запущена.")
             return None
+        if held and not calls:
+            log.warning("LLM заявил о действии без вызова инструмента: %r", " ".join(held))
+            self._replace_last_answer(" ".join(held), HONEST_NO_TOOL)
+            spoken.append(HONEST_NO_TOOL)
+            self.say(HONEST_NO_TOOL)
+        elif held:                                     # a tool ran: its verified reply replaces the narration
+            self._replace_last_answer(" ".join(held), "")
+        if spoken:
+            self.emit("assistant_done", text=" ".join(spoken))
         action = None
         for c in calls:
             log.info("tool call: %s %s", c["name"], c["arguments"])
@@ -444,11 +497,22 @@ class Assistant:
             if r is not None:
                 self.llm.add_assistant_message(r.reply or f"[{c['name']}]")
                 action = self._run_result(r) or action
+            else:
+                self.say("Не получилось: такой команды у меня нет.")
         self._turns += 1
         cap = int(self.cfg["llm"].get("max_history_messages", 16))
         if len(self.llm.history) >= cap and self._turns % max(2, cap // 4) == 0:
             self._summarize_async(self.llm.history[: cap // 2])
         return action
+
+    def _replace_last_answer(self, old: str, new: str) -> None:
+        """Fix the stored assistant turn so the model does not learn from its own false claim."""
+        h = self.llm.history
+        if h and h[-1].get("role") == "assistant" and old[:20] in h[-1].get("content", ""):
+            if new:
+                h[-1] = {"role": "assistant", "content": new}
+            else:
+                h.pop()
 
     def _summarize_async(self, messages: list) -> None:
         mem = self.router.by_name.get("memory")
@@ -475,17 +539,24 @@ class Assistant:
         return Microphone(a.get("input_device"), int(a.get("sample_rate", 16000)), int(a.get("frame_ms", 30)))
 
     def _frames(self, mic):
-        """Mic frames with level events; while muted, frames are dropped."""
+        """Mic frames with level events; while muted, frames are dropped.
+        While Jarvis speaks (plus a short tail for echo) the mic hears silence, so its own
+        voice can never wake it or become a command; timeouts keep running on the silence."""
         k = 0
+        tail = float(self.cfg["assistant"].get("tts_tail_ms", 500) or 0) / 1000.0
         for frame in mic.frames(self.stop_event):
             if self.mic_muted:
+                continue
+            if self.speaker is not None and self.speaker.active(tail):
+                yield np.zeros_like(frame)
                 continue
             k += 1
             if k % 3 == 0:
                 self.emit("mic_level", level=min(1.0, float(np.sqrt(np.mean(frame * frame))) * 8))
             yield frame
 
-    def _listen(self, mic, vad, timeout: Optional[float] = None, abort: Optional[Callable[[], bool]] = None):
+    def _listen(self, mic, vad, timeout: Optional[float] = None, abort: Optional[Callable[[], bool]] = None,
+                silence_ms: Optional[int] = None, max_s: Optional[float] = None):
         from .audio import segment_utterance
         a = self.cfg["audio"]
         deadline = time.monotonic() + timeout if timeout else None
@@ -496,8 +567,8 @@ class Assistant:
 
         return segment_utterance(
             self._frames(mic), vad, mic.rate,
-            frame_ms=int(a.get("frame_ms", 30)), silence_ms=int(a.get("silence_ms", 800)),
-            min_speech_ms=int(a.get("min_speech_ms", 250)), max_utterance_s=float(a.get("max_utterance_s", 15)),
+            frame_ms=int(a.get("frame_ms", 30)), silence_ms=int(silence_ms or a.get("silence_ms", 800)),
+            min_speech_ms=int(a.get("min_speech_ms", 250)), max_utterance_s=float(max_s or a.get("max_utterance_s", 15)),
             pre_roll_ms=int(a.get("pre_roll_ms", 300)), should_stop=should_stop)
 
     def _execute_voice(self, mic, command: str) -> None:
@@ -512,11 +583,26 @@ class Assistant:
     def ptt_release(self) -> None:
         self._ptt_active.clear()
 
+    def _wake_flow(self, mic, vad) -> WakeFlow:
+        def say(text: str) -> None:
+            self.say(text, wait=True)
+            mic.clear()
+
+        return WakeFlow(
+            detect=lambda t: self.wake.detect(t),
+            listen=lambda timeout=None, silence_ms=None, max_s=None: self._listen(
+                mic, vad, timeout=timeout, silence_ms=silence_ms, max_s=max_s, abort=lambda: self.mode != "wake"),
+            transcribe=lambda audio: self.stt.transcribe(audio, language=self.router.stt_language()),
+            say=say,
+            execute=lambda command: self._execute_voice(mic, command),
+            emit=lambda st: self.emit("state", state="muted" if self.mic_muted else st),
+            awaiting=lambda: bool(self.router.awaiting_input),
+            cfg=self.cfg["assistant"],
+            follow_allowed=lambda: self.profile != "game")
+
     def run_voice(self) -> None:
         """Wake word / push-to-talk loop (mode can be switched at runtime)."""
         from .audio import make_vad
-        a = self.cfg["assistant"]
-        follow_up = float(a.get("follow_up_seconds", 0) or 0)
         vad = make_vad(self.cfg["audio"])
         with self._new_mic() as mic:
             self._mic = mic
@@ -524,10 +610,10 @@ class Assistant:
                 mic.stop()
             self.greet()
             mic.clear()
-            follow_until = 0.0
-            print(f"Слушаю... Скажи «{self.name}» и команду. Ctrl+C - выход.")
+            flow = self._wake_flow(mic, vad)
+            print(f"Сплю. Скажи «{self.name}» (или «{self.name}, <команда>»). Ctrl+C - выход.")
             while not self.stop_event.is_set():
-                self.emit("state", state="muted" if self.mic_muted else "idle")
+                self.emit("state", state="muted" if self.mic_muted else ("sleeping" if self.mode == "wake" else "idle"))
                 if self.mode == "ptt":
                     if not self._ptt_active.wait(0.2):
                         mic.clear()
@@ -548,38 +634,8 @@ class Assistant:
                         self._execute_voice(mic, wr.command if wr.detected and wr.command else text)
                     continue
 
-                awaiting = self.router.awaiting_input
-                in_follow_up = awaiting or time.monotonic() < follow_until
-                audio = self._listen(mic, vad, timeout=None if awaiting else (
-                    (follow_until - time.monotonic()) if in_follow_up else None),
-                    abort=lambda: self.mode != "wake")
-                if audio is None:
-                    follow_until = 0.0
-                    continue
-                self.emit("state", state="thinking")
-                text = self.stt.transcribe(audio, language=self.router.stt_language())
-                if not text:
-                    continue
-                wr = self.wake.detect(text)
-                if wr.detected:
-                    command = wr.command
-                    if not command:
-                        print(f"Ты: {text}")
-                        self.emit("user_text", text=text, source="voice")
-                        self.say(a.get("wake_reply", "Слушаю"), wait=True)
-                        mic.clear()
-                        self.emit("state", state="listening")
-                        audio = self._listen(mic, vad, timeout=8)
-                        command = self.stt.transcribe(audio) if audio is not None else ""
-                        if not command:
-                            continue
-                elif in_follow_up:
-                    command = text
-                else:
-                    log.debug("(без имени, пропускаю): %s", text)
-                    continue
-                self._execute_voice(mic, command)
-                follow_until = time.monotonic() + follow_up if follow_up > 0 and self.profile != "game" else 0.0
+                flow.cfg = self.cfg["assistant"]          # live: Settings changes apply at once
+                flow.step()
 
     def run_wav(self, path: str) -> None:
         from .audio import read_wav

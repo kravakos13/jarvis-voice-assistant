@@ -109,7 +109,7 @@ class CodeHelper:
             messages.append({"role": "user", "content": f"Измени этот код: {request}. Верни полный исправленный код."})
         else:
             messages.append({"role": "user", "content": f"Платформа: {info['label']}. Задача: {request}"})
-        answer = self.llm.complete(messages, model=self._model(), temperature=0.2, num_ctx=8192)
+        answer = self.llm.complete(messages, model=self._model(), temperature=0.2, num_ctx=8192, lang="no_cjk")
         summary, code = extract_code(answer)
         if follow_up:
             proj = self.current

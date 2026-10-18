@@ -25,7 +25,7 @@ from . import headmesh as hm
 
 CYAN = QColor(70, 220, 255)
 DEEP = QColor(20, 120, 255)
-STATE_LABELS = {"idle": "", "listening": "СЛУШАЮ", "thinking": "ДУМАЮ", "speaking": "", "muted": "МИКРОФОН ВЫКЛ",
+STATE_LABELS = {"idle": "", "sleeping": "СПЛЮ", "listening": "СЛУШАЮ", "thinking": "ДУМАЮ", "speaking": "", "muted": "МИКРОФОН ВЫКЛ",
                 "loading": "ЗАГРУЗКА"}
 
 

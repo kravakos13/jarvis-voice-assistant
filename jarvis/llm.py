@@ -1,4 +1,13 @@
-"""Ollama local HTTP API client with streaming and capped history."""
+"""Ollama local HTTP API client with streaming, a token budget for the prompt and a Russian-language guard.
+
+qwen2.5 drifts into Chinese when it loses its instructions or samples too hot. 1.0.4 defends in depth:
+  * the Russian-only rule is ALWAYS appended to the system prompt (also to custom prompts and one-off calls);
+  * num_ctx 8192 + a token budget: history is trimmed so system prompt + tool schemas + history + the answer
+    (num_predict) always fit — Ollama never silently truncates/shifts the context and drops the system prompt;
+  * sane sampling (temperature 0.6, top_p 0.9, top_k 40, repeat_penalty 1.1);
+  * replies are checked: CJK characters (or a mostly non-Cyrillic answer) -> regenerate once with a
+    corrective instruction, then strip CJK as the last resort; clean_for_speech never passes CJK to Piper.
+"""
 from __future__ import annotations
 
 import datetime as _dt
@@ -20,13 +29,60 @@ class LLMError(RuntimeError):
     pass
 
 
+RU_RULE = ("ЯЗЫК: отвечай только на русском языке, русскими буквами. Никогда не пиши по-китайски, "
+           "по-японски, по-корейски и не используй иероглифы; не переходи на английский, даже если вопрос, "
+           "найденные данные или результаты инструментов на другом языке. Названия и имена можно оставить как есть.")
+CORRECTION = ("Твой предыдущий ответ был не на русском языке. Ответь на последнее сообщение пользователя "
+              "заново, коротко и только по-русски.")
+# CJK ideographs (+ext A, compat), kana, hangul, CJK/fullwidth punctuation
+_CJK_RE = re.compile(r"[\u2E80-\u2FDF\u3000-\u303F\u3040-\u30FF\u3100-\u312F\u3130-\u318F\u31A0-\u31FF"
+                     r"\u3200-\u32FF\u3400-\u4DBF\u4E00-\u9FFF\uA960-\uA97F\uAC00-\uD7AF\uF900-\uFAFF"
+                     r"\uFE30-\uFE4F\uFF00-\uFF65]")
+_CYR_RE = re.compile(r"[а-яёА-ЯЁ]")
+_LETTER_RE = re.compile(r"[^\W\d_]")
+
+
+def has_cjk(text: str) -> bool:
+    return bool(_CJK_RE.search(text or ""))
+
+
+def strip_cjk(text: str) -> str:
+    out = _CJK_RE.sub(" ", text or "")
+    out = re.sub(r"\s+([,.!?…;:])", r"\1", out)
+    return re.sub(r"[ \t]{2,}", " ", out).strip()
+
+
+def cyrillic_ratio(text: str) -> float:
+    letters = _LETTER_RE.findall(text or "")
+    return (len(_CYR_RE.findall(text or "")) / len(letters)) if letters else 1.0
+
+
+def not_russian(text: str, min_letters: int = 40) -> bool:
+    """CJK anywhere, or a long reply that is mostly not Cyrillic (English drift). Short Latin names
+    («Включаю Imagine Dragons») are fine."""
+    if has_cjk(text):
+        return True
+    letters = len(_LETTER_RE.findall(text or ""))
+    return letters >= min_letters and cyrillic_ratio(text) < 0.25
+
+
+def est_tokens(obj) -> int:
+    """Conservative token estimate for budgeting (qwen2.5: ~3 chars/token for Russian, ~4 for JSON)."""
+    text = obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False)
+    return len(text) // 3 + 4
+
+
 class OllamaChat:
     def __init__(self, cfg: dict, session: Optional[requests.Session] = None):
         self.host = str(cfg.get("host", "http://localhost:11434")).rstrip("/")
         self.model = cfg.get("model", "qwen2.5:7b")
         self.system_prompt = cfg.get("system_prompt", "")
-        self.temperature = float(cfg.get("temperature", 0.8))
-        self.num_ctx = int(cfg.get("num_ctx", 4096))
+        self.temperature = float(cfg.get("temperature", 0.6))
+        self.num_ctx = max(2048, int(cfg.get("num_ctx", 8192)))
+        self.num_predict = int(cfg.get("num_predict", 512))          # voice answers are short
+        self.top_p = float(cfg.get("top_p", 0.9))
+        self.top_k = int(cfg.get("top_k", 40))
+        self.repeat_penalty = float(cfg.get("repeat_penalty", 1.1))
         self.max_history = int(cfg.get("max_history_messages", 16))
         self.timeout = float(cfg.get("timeout_s", 120))
         self.keep_alive = cfg.get("keep_alive", "30m")
@@ -71,14 +127,45 @@ class OllamaChat:
         content = f"{self.system_prompt}\n\n{stamp}"
         if extra:
             content += f"\n\n{extra}"
+        content += f"\n\n{RU_RULE}"            # always last: survives custom prompts, strongest position
         return {"role": "system", "content": content}
+
+    def options(self, temperature: Optional[float] = None, num_ctx: Optional[int] = None,
+                num_predict: Optional[int] = None) -> dict:
+        o = {"temperature": self.temperature if temperature is None else temperature,
+             "top_p": self.top_p, "top_k": self.top_k, "repeat_penalty": self.repeat_penalty,
+             "num_ctx": num_ctx or self.num_ctx}
+        if num_predict:
+            o["num_predict"] = num_predict
+        return o
 
     def _trim(self) -> None:
         if self.max_history > 0 and len(self.history) > self.max_history:
             self.history = self.history[-self.max_history:]
-            # never start the history with an assistant reply
-            while self.history and self.history[0]["role"] != "user":
-                self.history.pop(0)
+        # never start the history with an assistant reply
+        while self.history and self.history[0]["role"] != "user":
+            self.history.pop(0)
+
+    def _fit(self, system: dict, tools: Optional[list]) -> list[dict]:
+        """Drop the oldest turns until system + tools + history + answer fit into num_ctx (with margin), so
+        Ollama never truncates the prompt itself (which loses the system prompt / Russian rule)."""
+        budget = self.num_ctx - self.num_predict - 256 - est_tokens(system["content"]) - (est_tokens(tools) if tools else 0)
+        hist = list(self.history)
+        dropped = 0
+        while len(hist) > 1 and sum(est_tokens(m.get("content", "")) for m in hist) > budget:
+            hist.pop(0)
+            dropped += 1
+            while len(hist) > 1 and hist[0]["role"] != "user":
+                hist.pop(0)
+                dropped += 1
+        if hist and est_tokens(hist[-1].get("content", "")) > budget > 200:     # one giant message: cut its head
+            m = dict(hist[-1])
+            m["content"] = m["content"][-budget * 3:]
+            hist[-1] = m
+        if dropped:
+            log.info("LLM: история урезана на %d сообщений, чтобы влезть в num_ctx=%d", dropped, self.num_ctx)
+            self.history = hist
+        return hist
 
     # ---------------------------------------------------------------- chat
     def _post_stream(self, payload: dict) -> Iterator[dict]:
@@ -107,12 +194,13 @@ class OllamaChat:
         self.history.append({"role": "user", "content": user_text})
         self._trim()
         self._last_user_text = user_text
+        system = self._system_message()
         payload = {
             "model": self.model,
-            "messages": [self._system_message()] + self.history,
+            "messages": [system] + self._fit(system, tools),
             "stream": True,
             "keep_alive": self.keep_alive,
-            "options": {"temperature": self.temperature, "num_ctx": self.num_ctx},
+            "options": self.options(num_predict=self.num_predict),
         }
         if tools:
             payload["tools"] = tools
@@ -161,18 +249,60 @@ class OllamaChat:
     def ask(self, user_text: str) -> str:
         return strip_think("".join(self.stream(user_text))).strip()
 
+    def regenerate_russian(self) -> str:
+        """The streamed answer drifted (CJK / not Russian): ask again with a corrective instruction.
+        The history ends with the user's message (the drifted answer was not stored). Stores the result."""
+        if self.history and self.history[-1]["role"] == "assistant" and (
+                has_cjk(self.history[-1]["content"]) or not_russian(self.history[-1]["content"])):
+            self.history.pop()                       # never keep (or learn from) the drifted answer
+        system = self._system_message()
+        msgs = [system] + self._fit(system, None) + [{"role": "user", "content": CORRECTION}]
+        out = self.complete(msgs, temperature=0.3, lang="ru", _ru_rule=False)
+        out = out or "Извини, сбился. Повтори, пожалуйста."
+        self.history.append({"role": "assistant", "content": out})
+        self._trim()
+        return out
+
+    @staticmethod
+    def _with_ru_rule(messages: list[dict]) -> list[dict]:
+        msgs = [dict(m) for m in messages]
+        if msgs and msgs[0].get("role") == "system":
+            if RU_RULE not in msgs[0].get("content", ""):
+                msgs[0]["content"] = f"{msgs[0].get('content', '')}\n\n{RU_RULE}"
+        else:
+            msgs.insert(0, {"role": "system", "content": RU_RULE})
+        return msgs
+
     def complete(self, messages: list[dict], model: Optional[str] = None, fmt: Optional[str] = None,
                  temperature: Optional[float] = None, num_ctx: Optional[int] = None,
-                 timeout: Optional[float] = None) -> str:
+                 timeout: Optional[float] = None, lang: str = "ru", _ru_rule: bool = True) -> str:
         """One-off, non-streaming request that does not touch the conversation history.
-        fmt="json" asks Ollama for strict JSON output."""
+        fmt="json" asks Ollama for strict JSON output.
+        lang: "ru" (default; Russian rule + check, retry once, strip CJK) | "no_cjk" (code/JSON: only CJK is
+        checked) | "any" (translator: target language decided by the caller)."""
+        if lang == "ru" and _ru_rule:
+            messages = self._with_ru_rule(messages)
+        out = self._complete_once(messages, model, fmt, temperature, num_ctx, timeout)
+        bad = (lang == "ru" and not_russian(out)) or (lang == "no_cjk" and has_cjk(out))
+        if bad:
+            log.warning("LLM: ответ не на русском (%s…) — переспрашиваю", out[:60].replace("\n", " "))
+            fix = CORRECTION if lang == "ru" else "Не используй китайские/японские иероглифы. Повтори ответ без них."
+            retry = self._complete_once(messages + [{"role": "assistant", "content": out},
+                                                    {"role": "user", "content": fix}],
+                                        model, fmt, 0.3, num_ctx, timeout)
+            if retry and not (lang == "ru" and not_russian(retry)) and not has_cjk(retry):
+                return retry
+            out = retry or out                      # the corrected attempt is the better base to clean
+        return strip_cjk(out) if lang != "any" and has_cjk(out) else out
+
+    def _complete_once(self, messages: list[dict], model: Optional[str], fmt: Optional[str],
+                       temperature: Optional[float], num_ctx: Optional[int], timeout: Optional[float]) -> str:
         payload = {
             "model": model or self.model,
             "messages": messages,
             "stream": False,
             "keep_alive": self.keep_alive if (model or self.model) == self.model else self.aux_keep_alive,
-            "options": {"temperature": self.temperature if temperature is None else temperature,
-                        "num_ctx": num_ctx or self.num_ctx},
+            "options": self.options(temperature, num_ctx),
         }
         if fmt:
             payload["format"] = fmt
@@ -238,13 +368,14 @@ def clean_for_speech(text: str) -> str:
     text = re.sub(r"[*_#>|~]+", " ", text)
     text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)
     text = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]", "", text)  # emoji
+    text = strip_cjk(text)                     # Piper cannot (and must not) speak hieroglyphs
     return re.sub(r"\s+", " ", text).strip()
 
 
 class SentenceSplitter:
     """Accumulates streamed tokens and emits complete sentences for TTS."""
 
-    _END_RE = re.compile(r"([.!?…]+[\"»)]?)(\s+|$)")
+    _END_RE = re.compile(r"([.!?…。！？]+[\"»)」]?)(\s+|$)?")
 
     def __init__(self, min_chars: int = 12, max_chars: int = 220):
         self.buf = ""
@@ -263,7 +394,8 @@ class SentenceSplitter:
         while True:
             cut = None
             for m in self._END_RE.finditer(self.buf):
-                if m.end(1) >= self.min_chars and m.group(2):  # need whitespace after: sentence finished
+                # need whitespace after (sentence finished); CJK enders never get a space -> cut right away
+                if m.end(1) >= self.min_chars and (m.group(2) or m.group(1)[-1] in "。！？」"):
                     cut = m.end(1)
                     break
             if cut is None and len(self.buf) > self.max_chars:

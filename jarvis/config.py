@@ -28,19 +28,22 @@ DEFAULT_SYSTEM_PROMPT = (
 DEFAULTS: dict[str, Any] = {
     "assistant": {"name": "Джарвис", "user_name": "Флоки", "mode": "wake", "wake_reply": "Слушаю",
                   "greeting": "{hello}, мистер {user_name}, чего желаете?", "greeting_time_of_day": False,
-                  "greet_on_start": True, "follow_up_seconds": 6, "extra_wake_words": []},
+                  "greet_on_start": True, "follow_up_seconds": 0, "extra_wake_words": [],
+                  "request_timeout_s": 6, "request_silence_ms": 1200, "max_request_s": 15, "tts_tail_ms": 500},
     "stt": {"model": "small", "device": "auto", "compute_type": "auto", "language": "ru", "beam_size": 1,
             "download_root": "models/whisper", "initial_prompt": "Джарвис, привет."},
     "audio": {"input_device": None, "output_device": None, "sample_rate": 16000, "vad": "webrtc",
               "vad_aggressiveness": 2, "energy_threshold": 0.015, "frame_ms": 30, "silence_ms": 800,
               "min_speech_ms": 250, "max_utterance_s": 15, "pre_roll_ms": 300},
-    "llm": {"host": "http://localhost:11434", "model": "qwen2.5:7b", "temperature": 0.8, "num_ctx": 4096,
+    "llm": {"host": "http://localhost:11434", "model": "qwen2.5:7b", "temperature": 0.6, "num_ctx": 8192,
+            "num_predict": 512, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.1,
             "max_history_messages": 16, "timeout_s": 120, "keep_alive": "30m", "aux_keep_alive": "1m",
             "tool_calling": True, "system_prompt": DEFAULT_SYSTEM_PROMPT},
     "tts": {"engine": "piper", "piper_voice": "ru_RU-denis-medium", "voices_dir": "voices", "length_scale": 1.1,
             "fx": {"enabled": True, "intensity": 0.35},
             "volume": 1.0, "pyttsx3_rate": 180, "pyttsx3_voice": "", "speak_in_text_mode": True},
     "tools": {"enabled": True, "websites": {}, "apps": {}},
+    "windows": {"enabled": True},
     "gui": {"enabled": True, "always_on_top": False, "start_minimized": False, "close_to_tray": True,
             "hotkey_show": "ctrl+alt+j", "hotkey_ptt": "ctrl+alt+space", "hotkey_game": "ctrl+alt+g", "fps": 30},
     "autostart": {"enabled": True},
@@ -71,7 +74,7 @@ def _read_yaml(path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 4
 REMOVED_SECTIONS = ("whatsapp", "comfyui", "faceswap", "video")
 
 
@@ -93,6 +96,25 @@ def migrate_local(data) -> tuple[dict, bool]:
         if "hotkey_mute" in g:
             g["hotkey_mic"] = g.pop("hotkey_mute")
         data["config_version"] = 2
+        ver = 2
+        changed = True
+    if ver < 3:                                   # 1.0.4: old LLM defaults caused Chinese drift
+        llm_raw = data.get("llm")
+        llm: dict = llm_raw if isinstance(llm_raw, dict) else {}
+        if llm.get("temperature") in (0.8, "0.8"):
+            llm.pop("temperature")                # -> new default 0.6 (a value the user changed is kept)
+        try:
+            if int(llm.get("num_ctx", 0) or 0) and int(llm["num_ctx"]) <= 4096:
+                llm.pop("num_ctx")                # -> 8192: system prompt + tools + history must fit
+        except (TypeError, ValueError):
+            llm.pop("num_ctx", None)
+        data["config_version"] = 3
+        changed = True
+    if ver < 4:                                   # 1.0.4: strict wake word — no follow-up listening by default
+        a = data.get("assistant")
+        if isinstance(a, dict) and str(a.get("follow_up_seconds", "")).strip() in ("6", "6.0"):
+            a.pop("follow_up_seconds")            # old default pinned by Settings -> new default 0 (off)
+        data["config_version"] = 4
         changed = True
     return data, changed
 

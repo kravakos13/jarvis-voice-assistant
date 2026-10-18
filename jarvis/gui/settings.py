@@ -34,7 +34,7 @@ THEMES = {"Голограмма (голубая)": "#46dcff", "Марк (кра�
           "Фиолетовая": "#b28cff", "Белая": "#e8f6ff"}
 MODULES = [("memory", "Долговременная память"), ("planner", "Задачи и напоминания"), ("notes", "Заметки"),
            ("timers", "Таймеры"), ("media", "YouTube / YouTube Music"), ("apps", "Игры и программы"),
-           ("system", "Система (громкость, питание)"), ("weather", "Погода"), ("web_search", "Ответы из интернета"),
+           ("system", "Система (громкость, питание)"), ("windows", "Окна (закрыть/свернуть)"), ("weather", "Погода"), ("web_search", "Ответы из интернета"),
            ("screen", "Понимание экрана"), ("game", "Помощь в играх"), ("code", "Код для микроконтроллеров"),
            ("cad", "3D-модели"), ("smarthome", "Умный дом"), ("telegram", "Telegram"), ("translator", "Переводчик"),
            ("dictate", "Диктовка в любое окно"), ("monitor", "Температура ПК"), ("alerts", "Воздушные тревоги"),
@@ -337,7 +337,10 @@ class SettingsDialog(QDialog):
         self._add(f, "assistant.greeting", "Приветствие", tip="{hello} = «Добрый день», {user_name} = имя")
         self._add(f, "assistant.greeting_time_of_day", "Приветствие по времени суток (утро/день/вечер/ночь)", "bool")
         self._add(f, "assistant.wake_reply", "Ответ на одно имя")
-        self._add(f, "assistant.follow_up_seconds", "Слушать без имени после ответа", "int", max=60, suffix=" с")
+        self._add(f, "assistant.follow_up_seconds", "Слушать без имени после ответа (0 — выкл.)", "int", max=60, suffix=" с",
+                  tip="По умолчанию 0: после ответа Джарвис засыпает до следующего «Джарвис»")
+        self._add(f, "assistant.request_timeout_s", "После «Слушаю» ждать просьбу", "int", min=2, max=30, suffix=" с",
+                  tip="Если за это время ничего не сказать, Джарвис молча засыпает")
         f2 = self._group(v, "Запуск")
         self._add(f2, "autostart.enabled", "Запускать вместе с Windows", "bool")
         self._add(f2, "gui.start_minimized", "Запускаться свёрнутым в трей", "bool")

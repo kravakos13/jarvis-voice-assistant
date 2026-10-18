@@ -12,7 +12,7 @@ THREE.ColorManagement.enabled = false;
 const params = new URLSearchParams(location.search);
 // ?still=1: frontal, symmetric, static portrait (used to render the bundled default face image)
 const STILL = params.has('still');
-const LABELS = { listening: 'СЛУШАЮ', thinking: 'ДУМАЮ', muted: 'МИКРОФОН ВЫКЛ', loading: 'ЗАГРУЗКА' };
+const LABELS = { sleeping: 'СПЛЮ', listening: 'СЛУШАЮ', thinking: 'ДУМАЮ', muted: 'МИКРОФОН ВЫКЛ', loading: 'ЗАГРУЗКА' };
 const S = {
   state: params.get('state') || 'loading', mic: 0, micS: 0,
   env: [], envDt: 0.02, envStart: 0, mouth: 0,

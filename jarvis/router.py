@@ -28,6 +28,7 @@ SKILLS = [
     ("weather", "weather_skill", "WeatherSkill"),
     ("system", "system_skill", "SystemSkill"),
     ("smarthome", "smarthome_skill", "SmartHomeSkill"),
+    ("windows", "windows_skill", "WindowsSkill"),
     ("telegram", "telegram_skill", "TelegramSkill"),
     ("media", "media_skill", "MediaSkill"),
     ("tools", "core", "CoreSkill"),

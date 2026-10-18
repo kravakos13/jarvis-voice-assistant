@@ -209,7 +209,7 @@ def test_config_migration(tmp_path, monkeypatch):
     assert cfg["assistant"]["name"] == "Джарвис" and cfg["gui"]["hotkey_mic"] == "ctrl+alt+k"
     assert "whatsapp" not in cfg
     saved = yaml.safe_load(old.read_text(encoding="utf-8"))
-    assert saved["config_version"] == 2 and "whatsapp" not in saved
+    assert saved["config_version"] == c.CONFIG_VERSION and "whatsapp" not in saved
     old.write_text("{{{ broken", encoding="utf-8")
     cfg = c.load_config()                                                      # corrupted file -> defaults, no crash
     assert cfg["assistant"]["name"] == "Джарвис"

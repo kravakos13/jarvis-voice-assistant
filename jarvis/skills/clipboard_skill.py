@@ -23,10 +23,11 @@ def get_clipboard() -> str:
 class ClipboardSkill(Skill):
     name = "clipboard"
 
-    def _llm(self, instruction: str, text: str) -> str:
+    def _llm(self, instruction: str, text: str, lang: str = "ru") -> str:
         return self.ctx.llm.complete([
-            {"role": "system", "content": "Ты помощник. Отвечай по-русски кратко, без markdown, ответ будет озвучен."},
-            {"role": "user", "content": f"{instruction}\n\n{text[:6000]}"}])
+            {"role": "system", "content": "Ты помощник. Отвечай по-русски кратко, без markdown, ответ будет озвучен."
+             if lang == "ru" else "Ты переводчик. Выводи только перевод, без пояснений."},
+            {"role": "user", "content": f"{instruction}\n\n{text[:6000]}"}], lang=lang)
 
     def match(self, text: str, t: str) -> Optional[ToolResult]:
         if not re.search(CLIP, t):
@@ -37,7 +38,8 @@ class ClipboardSkill(Skill):
         m = TRANSLATE_RE.search(t)
         if m:
             lang = m.group(2) or ("русский" if not re.search(r"[а-яё]", clip.lower()) else "английский")
-            return ToolResult("", then=lambda: self._llm(f"Переведи текст на {lang}. Выведи только перевод.", clip))
+            return ToolResult("", then=lambda: self._llm(f"Переведи текст на {lang}. Выведи только перевод.", clip,
+                                                         "ru" if lang.startswith("русск") else "any"))
         m = EXPLAIN_RE.search(t)
         if m:
             what = {"исправь": "Исправь ошибки в тексте и прочитай исправленный вариант."}.get(

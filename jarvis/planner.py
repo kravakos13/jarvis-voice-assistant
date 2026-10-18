@@ -181,7 +181,7 @@ def parse_task_llm(text: str, llm, now: Optional[_dt.datetime] = None) -> Parsed
         '{"task": "текст задачи", "due": "YYYY-MM-DD HH:MM"} или "due": null, если времени нет.\n'
         f"Фраза: {text}")
     try:
-        out = llm.complete([{"role": "user", "content": prompt}], fmt="json", temperature=0)
+        out = llm.complete([{"role": "user", "content": prompt}], fmt="json", temperature=0, lang="no_cjk")
         data = json.loads(out)
         due = data.get("due")
         due_dt = _dt.datetime.strptime(due.strip(), "%Y-%m-%d %H:%M") if due else None

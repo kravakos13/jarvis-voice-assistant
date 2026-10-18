@@ -216,7 +216,7 @@ class CadHelper:
         res = ModelResult(False, folder)
         for attempt in range(2):            # first try + one retry with the error message
             res.attempts = attempt + 1
-            answer = self.llm.complete(messages, model=self._model(), temperature=0.2, num_ctx=8192)
+            answer = self.llm.complete(messages, model=self._model(), temperature=0.2, num_ctx=8192, lang="no_cjk")
             summary, code = extract_code(answer)
             res.summary = res.summary or summary
             if kind == "cadquery":

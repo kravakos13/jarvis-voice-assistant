@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -201,6 +202,7 @@ class Speaker:
         self._q: "queue.Queue" = queue.Queue()
         self.volume = 1.0              # profile volume (night mode = quiet)
         self._interrupt = threading.Event()
+        self._last_end = 0.0           # monotonic time the last sentence finished playing
         self._thread = threading.Thread(target=self._run, name="jarvis-tts", daemon=True)
         self._thread.start()
 
@@ -213,6 +215,13 @@ class Speaker:
         if not text or not self.enabled:
             return
         self._q.put((text, voice, self.volume if volume is None else volume))
+
+    def active(self, tail_s: float = 0.0) -> bool:
+        """Speaking now, queued, or finished less than tail_s ago (room echo / output latency).
+        The microphone ignores this time so Jarvis never hears (and wakes on) its own voice."""
+        if not self.enabled:
+            return False
+        return self._q.unfinished_tasks > 0 or time.monotonic() - self._last_end < tail_s
 
     def wait(self, timeout: Optional[float] = None) -> None:
         if self.enabled:
@@ -263,6 +272,7 @@ class Speaker:
             except Exception as e:
                 log.error("Ошибка TTS: %s", e)
             finally:
+                self._last_end = time.monotonic()
                 if text is not None and self._q.unfinished_tasks <= 1:
                     self.on_event("speech_end")
                 self._q.task_done()

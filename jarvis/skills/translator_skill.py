@@ -43,7 +43,8 @@ class TranslatorSkill(Skill):
         return self.ctx.llm.complete([
             {"role": "system", "content": "Ты профессиональный переводчик. Переводи естественно, разговорно, сохраняя "
                                           "смысл, тон и мат, если он есть. Выводи ТОЛЬКО перевод, без кавычек и пояснений."},
-            {"role": "user", "content": f"Переведи на {to_name}:\n{text}"}], temperature=0.2).strip().strip('"«»')
+            {"role": "user", "content": f"Переведи на {to_name}:\n{text}"}], temperature=0.2,
+            lang="ru" if to_name.lower().startswith("русск") else "any").strip().strip('"«»')
 
     def _one(self, text: str, lang: tuple) -> ToolResult:
         code, name, voice = lang
@@ -54,6 +55,8 @@ class TranslatorSkill(Skill):
         if MODE_OFF.search(t):
             self.target = None
             return ToolResult("Переводчик выключен.")
+        if self.target is None:
+            return None
         cyr = len(re.findall(r"[а-яё]", text.lower())) > len(re.findall(r"[a-z]", text.lower()))
         if cyr and self.target[0] != "uk":
             return self._one(text, self.target)
