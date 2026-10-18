@@ -112,7 +112,7 @@ def test_commands_yaml_examples_route(router, phrase):
     """Generated «горячие клавиши» table: every example does something (hotkeys, or windows for close/reopen tab)."""
     _desktop(router, "Браузер")
     res = router.handle(phrase)
-    assert res is not None and router.last_skill in ("hotkeys", "windows"), (phrase, router.last_skill)
+    assert res is not None and router.last_skill in ("hotkeys", "windows", "view"), (phrase, router.last_skill)
 
 
 def test_telegram_rows_match_telegram_skill():
@@ -130,3 +130,12 @@ def test_toc_links_resolve():
     ids = set(re.findall(r'id="([^"]+)"', h))
     links = re.findall(r'href="#([^"]+)"', h)
     assert len(links) >= 12 and not [x for x in links if x not in ids]
+
+
+@pytest.mark.parametrize("phrase,skill", [("найди в гугле погода в москве", "core"), ("загугли погода в москве", "core"),
+                                          ("найди в хроме погоду на завтра", "core"), ("какая погода", "weather"),
+                                          ("найди в интернете погоду в москве", "weather"), ("погода в москве", "weather")])
+def test_109_explicit_browser_search_beats_weather(router, phrase, skill):
+    _desktop(router, "Интернет")
+    res = router.handle(phrase)
+    assert res is not None and router.last_skill == skill, (phrase, router.last_skill)

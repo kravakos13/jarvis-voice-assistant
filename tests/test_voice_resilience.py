@@ -59,7 +59,7 @@ def make(texts, scripts, default="silence"):
     states, done = [], []
     a.emit = lambda ev, **d: (states.append(d.get("state")) if ev == "state" else None,
                               Assistant.emit.__get__(a)(ev, **d) if ev == "state" else None)
-    a._execute_voice = lambda mic, cmd: done.append(cmd)
+    a._execute_voice = lambda mic, cmd, *rest: done.append(cmd)
     it = iter(texts)
 
     def tr(audio, language=None):

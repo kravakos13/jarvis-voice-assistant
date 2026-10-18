@@ -38,6 +38,9 @@ class LLMError(RuntimeError):
 RU_RULE = ("ЯЗЫК: отвечай только на русском языке, русскими буквами. Никогда не пиши по-китайски, "
            "по-японски, по-корейски и не используй иероглифы; не переходи на английский, даже если вопрос, "
            "найденные данные или результаты инструментов на другом языке. Названия и имена можно оставить как есть.")
+ABILITIES = ("Ты работаешь на компьютере пользователя и умеешь открывать его файлы и папки, запускать программы и "
+             "закрывать окна. Никогда не говори, что у тебя нет доступа к файлам: если просят открыть файл, ответь "
+             "коротко, что можно сказать «Джарвис, открой файл <имя>» или «найди файл <имя>».")
 CORRECTION = ("Твой предыдущий ответ был не на русском языке. Ответь на последнее сообщение пользователя "
               "заново, коротко и только по-русски.")
 # CJK ideographs (+ext A, compat), kana, hangul, CJK/fullwidth punctuation
@@ -162,7 +165,7 @@ class OllamaChat:
         so the clock and memory hits go into the last user message instead (see _turn_context)."""
         now = _dt.datetime.now()
         stamp = f"Сегодня {_RU_WEEKDAYS[now.weekday()]}, {now.day} {_RU_MONTHS_GEN[now.month - 1]} {now.year} года."
-        content = f"{self.system_prompt}\n\n{stamp}\n\n{RU_RULE}"   # RU_RULE last: survives custom prompts
+        content = f"{self.system_prompt}\n\n{ABILITIES}\n\n{stamp}\n\n{RU_RULE}"   # RU_RULE last: survives custom prompts
         return {"role": "system", "content": content}
 
     style_hint = ""                                # e.g. conversation mode (in the user note: system stays cached)
@@ -203,9 +206,9 @@ class OllamaChat:
         if self.num_thread > 0:
             o["num_thread"] = self.num_thread       # 1.0.8: leave CPU cores to Windows and the user
         if self.on_cpu:
-            o["num_gpu"] = 0                        # all layers in RAM: VRAM stays free (games), slower
-        elif self.num_gpu is not None:
-            o["num_gpu"] = self.num_gpu             # auto-fit: what fits with ~1 GB VRAM headroom
+            o["num_gpu"] = 0                        # ONLY by the user's explicit «Оперативка» / «Авто» in a game
+        # 1.0.9: otherwise num_gpu is never sent — Ollama's own fit is right (25/29 layers on a 6 GB card), our
+        # estimate is only used to refuse a RAM-starving load (ensure_fit)
         return o
 
     # ---------------------------------------------------------------- 1.0.8: memory fit / self-test / cancel
@@ -254,10 +257,10 @@ class OllamaChat:
         n = resources.fit_layers(size, layers, self.num_ctx, vr[1] if vr else None, self.vram_headroom)
         spill = resources.spill_gb(size, layers, n)
         free_ram = resources.free_ram_gb()
-        self.num_gpu, self.blocked = n, ""
+        self.num_gpu, self.blocked = None, ""       # informational only: Ollama places the layers itself
         if n is not None:
-            log.warning("ИИ %s: в видеопамять влезает %d из %d слоёв (свободно %.1f ГБ, запас %.1f ГБ), %.1f ГБ уйдёт "
-                        "в оперативку", self.model, n, layers + 1, vr[1] if vr else -1, self.vram_headroom, spill)
+            log.info("ИИ %s: по оценке в видеопамять влезет ~%d из %d слоёв (свободно %.1f ГБ), ~%.1f ГБ уйдёт "
+                     "в оперативку — слои распределит Ollama", self.model, n, layers + 1, vr[1] if vr else -1, spill)
             if free_ram is not None and free_ram - spill < self.min_free_ram:
                 # never a silent switch to another model and never a silent CPU+RAM spill (Windows swapping)
                 self.blocked = (f"Сейчас мало свободной памяти: видеопамяти {vr[1] if vr else 0:.1f} ГБ, оперативки "
@@ -272,7 +275,8 @@ class OllamaChat:
             r = self.http.post(f"{self.host}/api/chat", timeout=60, json={
                 "model": self.model, "stream": False, "keep_alive": self.keep_alive,
                 "messages": [{"role": "user", "content": "Ответь одним словом по-русски: да или нет? Скажи «да»."}],
-                "options": {**self.options(temperature=0.0, num_predict=8), "num_ctx": 512}})
+                # the SAME num_ctx / num_gpu as real requests: anything else makes Ollama reload the model
+                "options": self.options(temperature=0.0, num_predict=8)})
             text = ((r.json().get("message") or {}).get("content") or "").strip()
         except Exception as e:                       # noqa: BLE001
             log.info("Самопроверка ИИ: %s", e)
@@ -327,6 +331,24 @@ class OllamaChat:
         except Exception as e:
             log.info("Прогрев модели не удался: %s", e)
             return None
+
+    def placement_report(self, gpu_present: Optional[bool] = None) -> tuple[str, bool]:
+        """After a load: («ИИ: N/29 слоёв на GPU, X ГБ VRAM», warn). warn = a CUDA GPU exists but the model got no
+        VRAM although the user did not choose «Оперативка»."""
+        info = self.placement_info()
+        if info is None:
+            return "", False
+        _size, layers = self._model_meta()
+        total = layers + 1
+        n = round(info["gpu_share"] * total)
+        line = (f"ИИ {self.model}: {n}/{total} слоёв на GPU, {info['vram_gb']:.1f} из {info['size_gb']:.1f} ГБ "
+                f"в видеопамяти")
+        if self.on_cpu:
+            line += " (по настройке «Где работает ИИ: Оперативка» / игровой режим)"
+        if gpu_present is None:
+            from . import resources
+            gpu_present = resources.vram_gb() is not None
+        return line, bool(gpu_present and info["vram_gb"] <= 0.01 and not self.on_cpu)
 
     def placement_info(self) -> Optional[dict]:
         """What Ollama really did: {'model', 'size_gb', 'vram_gb', 'gpu_share'} from /api/ps (None if unknown).
@@ -610,7 +632,52 @@ def clean_for_speech(text: str) -> str:
     text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)
     text = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]", "", text)  # emoji
     text = strip_cjk(text)                     # Piper cannot (and must not) speak hieroglyphs
+    text = strip_mixed_junk(text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+_HOMO = str.maketrans("aeopcxykmtABEKMHOPCTXY", "аеорсхукмтАВЕКМНОРСТХУ")
+_CYR = re.compile(r"[а-яё]", re.I)
+_LAT = re.compile(r"[a-z]", re.I)
+
+
+def _stutter(word: str) -> bool:
+    """«systemsystsem», «httpshttps»: a Latin chunk of 4+ letters repeated inside one long word."""
+    w = word.lower()
+    return len(w) >= 8 and any(w.count(w[i:i + 4]) > 1 for i in range(len(w) - 3))
+
+
+def strip_mixed_junk(text: str) -> str:
+    """1.0.9: a broken generation glues Latin junk to Russian words («файловомуsystemsystsem»). In a Russian
+    sentence: Latin glued onto a Cyrillic word is dropped, Latin homoglyphs inside a Cyrillic word are mapped to
+    Cyrillic («фaйл»), stuttering Latin junk words are dropped. Real names (YouTube, Steam, Wi-Fi) stay."""
+    words = text.split()
+    if sum(1 for w in words if _CYR.search(w)) <= sum(1 for w in words if _LAT.search(w) and not _CYR.search(w)):
+        return text                            # an English / code answer: leave it alone
+    out = []
+    for tok in re.split(r"(\s+)", text):
+        if not tok or tok.isspace() or not _LAT.search(tok):
+            out.append(tok)
+            continue
+        if _CYR.search(tok):
+            letters = re.sub(r"[^a-zа-яё]", "", tok.lower())
+            cyr = len(_CYR.findall(letters))
+            fixed = tok.translate(_HOMO)
+            if not _LAT.search(fixed):          # only homoglyphs: «фaйл» -> «файл»
+                out.append(fixed)
+                continue
+            m = re.match(r"^(\W*[а-яё][а-яё\-]*?)([a-z][a-z\W]*)$", tok, re.I)
+            if m and cyr >= 2:                  # «файловомуsystemsystsem» -> «файловому»
+                tail = re.sub(r"[a-z]", "", m.group(2), flags=re.I)
+                out.append(m.group(1) + tail)
+                continue
+            out.append(tok)
+            continue
+        if _stutter(re.sub(r"\W", "", tok)):
+            out.append(re.sub(r"[a-z]+", "", tok, flags=re.I))
+            continue
+        out.append(tok)
+    return "".join(out)
 
 
 class SentenceSplitter:

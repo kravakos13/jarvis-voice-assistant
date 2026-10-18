@@ -153,6 +153,7 @@ def segment_utterance(
     max_utterance_s: float = 15,
     pre_roll_ms: int = 300,
     should_stop: Optional[Callable[[], bool]] = None,
+    on_start: Optional[Callable[[], None]] = None,
 ) -> Optional[np.ndarray]:
     """Consume frames until one complete utterance is found.
 
@@ -180,6 +181,11 @@ def segment_utterance(
             start_run = start_run + 1 if speech else 0
             if start_run >= 3:  # ~90 ms of speech starts the phrase
                 triggered = True
+                if on_start is not None:
+                    try:
+                        on_start()          # 1.0.9: snapshot the foreground window («закрой» = what was in front)
+                    except Exception:       # noqa: BLE001 — never break listening
+                        pass
                 voiced.extend(pre)
                 pre.clear()
                 speech_frames = start_run

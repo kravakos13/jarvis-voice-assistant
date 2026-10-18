@@ -73,7 +73,7 @@ class MediaSkill(Skill):
             return ToolResult("Открываю ютуб музыку.", then=lambda: (self.media.open_ytmusic(), None)[1])
         if re.match(rf"^(?:открой|запусти) {YT}$", t):
             return ToolResult("Открываю ютуб.", then=lambda: (self.media.open_youtube(), None)[1])
-        m = re.match(rf"^(?:найди|поищи|покажи)(?: мне)? (?:на|в) {YT} (.+)$", t) or \
+        m = re.match(rf"^(?:найди|найти|нашел|ищи|поищи|покажи)(?: мне)? (?:на|в) {YT} (.+)$", t) or \
             re.match(rf"^(?:найди|поищи)(?: мне)? видео (.+?)(?: на {YT})?$", t)
         if m:
             q = m.group(1)

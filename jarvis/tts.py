@@ -206,6 +206,7 @@ class Speaker:
         self._interrupt = threading.Event()
         self._last_end = 0.0           # monotonic time the last sentence finished playing
         self._started = 0.0            # monotonic time the current sentence started (0 = idle)
+        self.hushed = False            # 1.0.9: cancelled turn — late sentences of that answer are dropped
         self._thread = threading.Thread(target=self._run, name="jarvis-tts", daemon=True)
         self._thread.start()
 
@@ -215,9 +216,17 @@ class Speaker:
 
     def say(self, text: str, voice: Optional[str] = None, volume: Optional[float] = None) -> None:
         text = clean_for_speech(text)
-        if not text or not self.enabled:
+        if not text or not self.enabled or self.hushed:
             return
         self._q.put((text, voice, self.volume if volume is None else volume))
+
+    def hush(self) -> None:
+        """Stop now and drop everything the cancelled answer still produces until unhush()."""
+        self.hushed = True
+        self.interrupt()
+
+    def unhush(self) -> None:
+        self.hushed = False
 
     def active(self, tail_s: float = 0.0) -> bool:
         """Speaking now, queued, or finished less than tail_s ago (room echo / output latency).

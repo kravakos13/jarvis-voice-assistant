@@ -25,6 +25,7 @@ class ToolResult:
     expect: Optional[Callable[[str], "ToolResult"]] = None  # next user phrase goes to this callback
     links: list = field(default_factory=list)    # [(title, url)] shown in the GUI chat
     voice: Optional[str] = None                  # speak with another Piper voice (translator)
+    noname_say: bool = False                     # 1.0.9: speak this reply even for a no-name command (rare hints)
 
 
 class Skill:

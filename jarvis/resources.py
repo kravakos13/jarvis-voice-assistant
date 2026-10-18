@@ -20,14 +20,14 @@ IS_WIN = sys.platform == "win32"
 
 # presets: Settings → «Нагрузка». Explicit values in the config sections always win over the preset.
 PRESETS: dict[str, dict[str, Any]] = {
-    # default: qwen2.5:7b (full personality), 4 threads, model unloaded after 5 min idle, lower priority
-    "balanced": {"threads": 4, "keep_alive": "5m", "num_ctx": 4096, "face_fps": 30, "vram_headroom_gb": 1.0,
+    # default: qwen2.5:7b (full personality), 4 threads, model stays loaded (1.0.9: unloaded only in game mode), lower priority
+    "balanced": {"threads": 4, "keep_alive": "24h", "num_ctx": 4096, "face_fps": 30, "vram_headroom_gb": 0.45,
                  "min_free_ram_gb": 6.0, "tools": "core", "priority": "below_normal", "model": None},
     # opt-in: the small model (~2 GB): fits next to games/Chrome, noticeably simpler answers
     "light": {"threads": 4, "keep_alive": "5m", "num_ctx": 4096, "face_fps": 24, "vram_headroom_gb": 1.0,
               "min_free_ram_gb": 6.0, "tools": "core", "priority": "below_normal", "model": "qwen2.5:3b"},
-    # 1.0.7-like: all threads, model kept 30 min, every tool offered to the model, normal priority
-    "max": {"threads": 0, "keep_alive": "30m", "num_ctx": 6144, "face_fps": 30, "vram_headroom_gb": 0.6,
+    # 1.0.7-like: all threads, model stays loaded, every tool offered to the model, normal priority
+    "max": {"threads": 0, "keep_alive": "24h", "num_ctx": 6144, "face_fps": 30, "vram_headroom_gb": 0.45,
             "min_free_ram_gb": 4.0, "tools": "all", "priority": "normal", "model": None},
 }
 PRESET_NAMES = {"balanced": "Обычная (по умолчанию)", "light": "Лёгкая — модель qwen2.5:3b",

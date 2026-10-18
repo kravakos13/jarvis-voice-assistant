@@ -122,9 +122,12 @@ class HotkeysSkill(Skill):
             if n is None or n == 0:
                 return None
             if action == "tab_n":
-                if not (n == -1 or 1 <= n <= 8):
-                    return ToolResult("Могу переключить только вкладки с первой по восьмую и последнюю.")
-                return self._keys(w, "ctrl+9" if n == -1 else f"ctrl+{n}", reply)
+                if n == -1 or 1 <= n <= 8:
+                    return self._keys(w, "ctrl+9" if n == -1 else f"ctrl+{n}", reply)   # Ctrl+9 = the last tab
+                if n > 30:
+                    return ToolResult("Столько вкладок я не листаю — скажи «последняя вкладка».")
+                r = self._keys(w, "ctrl+1", reply)                                  # 9th+: first, then Ctrl+Tab
+                return r if r.reply != reply else self._keys(w, "ctrl+tab", reply, times=n - 1)
             return ToolResult("", then=lambda: self._result_link(w, n), background=True)
         keys = c.get("keys_firefox") if (w is not None and w.exe == "firefox.exe" and c.get("keys_firefox")) \
             else c.get("keys")

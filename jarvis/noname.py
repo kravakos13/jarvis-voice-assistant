@@ -33,7 +33,41 @@ GROUPS: list[tuple[str, str]] = [
     ("apps", "Открой / закрой / включи / выключи X — только известные программы, окна и сайты"),
     ("music", "Включи <песня> — коротко и чётко"),
     ("smarthome", "Умный дом — только с названием устройства («включи свет на кухне»)"),
+    ("search", "Поиск: «найди в гугле / в хроме / в интернете / на ютубе …», «загугли …» — открывает поиск"),
 ]
+MAX_WORDS_SEARCH = 15
+SEARCH_VERB = r"(?:найди|найти|нашел|нашли|найдешь|ищи|поищи|поищем|поиск|погугли|загугли|гугли|загуглим)"
+SEARCH_WHERE = (r"(?P<where>гугле|гугл|google|яндексе|яндекс|хроме|хром|chrome|браузере|интернете|инете|сети|"
+                r"ютубе|ютуб|youtube|ютюбе)")
+SEARCH_NN_RE = re.compile(rf"^(?P<verb>{SEARCH_VERB})(?:\s+мне)?(?:\s+(?:в|во|на|через)\s+{SEARCH_WHERE})?"
+                          rf"\s+(?P<q>.+)$")
+
+
+def parse_search(t: str) -> Optional[tuple[str, str]]:
+    """1.0.9 no-name search: ('web'|'youtube', query) — ONLY with an explicit marker («в гугле / в хроме /
+    в интернете / на ютубе», or the verb «загугли») and a real query, so speech or video audio can't trigger it."""
+    m = SEARCH_NN_RE.match(t)
+    if not m:
+        return None
+    where, verb = m.group("where") or "", m.group("verb")
+    q = re.sub(r"^(?:про|о|об)\s+", "", m.group("q").strip()).strip(" .,!?")   # «что такое X» is the query
+    if not where and not re.match(r"(?:за|по)?гугли", verb):
+        return None                                    # «найди ключи» — no marker: not a search command
+    if where:
+        q2 = re.sub(rf"^{SEARCH_WHERE}\s+", "", q)       # «найди в гугле в гугле …» stutter
+        q = q2 if q2 else q
+    if not q or len(q.split()) > MAX_WORDS_SEARCH or len(q) < 2:
+        return None
+    return ("youtube" if where.startswith(("ют", "you")) else "web"), q
+
+
+def search_command(t: str) -> Optional[str]:
+    p = parse_search(clean(t))
+    if p is None:
+        return None
+    return f"найди на ютубе {p[1]}" if p[0] == "youtube" else f"загугли {p[1]}"
+
+
 GROUP_IDS = [g for g, _ in GROUPS]
 
 FILLER_RE = re.compile(r"^(?:(?:ну|давай|а|так|пожалуйста|слушай|эй|ка)\s+)+")
@@ -56,7 +90,7 @@ VOL_RE = re.compile(r"^(?:(?:сделай|еще|ещё|чуть|немного)
 CLOSE_VERBS = ("закрой", "выключи", "выруби")
 OPEN_VERBS = ("открой", "запусти", "включи", "вруби")
 NEVER = re.compile(r"\b(компьютер\w*|комп|пк|систем\w*|перезагру\w*|заблокир\w*|блокир\w*|залочь|джарвис\w*|себя|"
-                   r"ассистент\w*)\b")
+                   r"ассистент\w*|игру|игра|игры|игрушк\w*|игрух\w*)\b")             # «закрой игру» — only with the name
 
 
 DICT_NOT = re.compile(r"\b(скетч|код|кода|программ\w*|скрипт\w*|функци\w*|телеграм\w*|телег[уе]|люмо|"
@@ -76,6 +110,8 @@ def clean(t: str) -> str:
     t = " ".join(normalize(t or "").lower().replace("ё", "е").split())
     t = FILLER_RE.sub("", t)
     t = TAIL_RE.sub("", t)
+    from .skills.windows_skill import SPLIT_RE
+    t = SPLIT_RE.sub(r"\1 \2\3", t)                  # «закройки берпанк» -> «закрой киберпанк»
     return canonical(t)
 
 
@@ -91,6 +127,8 @@ def classify(t: str, router: Any = None) -> Optional[str]:
     if not t:
         return None
     n = len(t.split())
+    if parse_search(t) is not None:                   # own word limit (queries are longer than commands)
+        return "search"
     if ONCE_RE.match(t):                               # «напиши скетч / маме в телеграм» belong to code/telegram
         return "dictation" if n <= MAX_WORDS_TYPE and not DICT_NOT.search(t) else None
     if n > MAX_WORDS or NEVER.search(t):
@@ -102,6 +140,9 @@ def classify(t: str, router: Any = None) -> Optional[str]:
         return None if kp.combo in keys_skill.FORBIDDEN else "keys"
     if nav_skill.parse_seek(t) or nav_skill.parse_nav(t):
         return "nav"
+    from .skills.view_skill import parse_view
+    if parse_view(t):
+        return "media"                                  # 1.0.9 «полный экран», «субтитры»
     if ws.BACK_TO_PREV.match(t):
         return "windows"
     if parse_pick(t):
@@ -122,12 +163,26 @@ def classify(t: str, router: Any = None) -> Optional[str]:
     if m:
         verb, rest = m.group(1), m.group(2).strip()
         target = ws._target_words(rest)
+        if ws.ALL_MOD.search(rest):                     # «закрой все окна (хрома)»
+            target = " ".join(w for w in target.split() if w not in ws.ALL_NOISE and not ws.ALL_MOD.fullmatch(w))
         if re.fullmatch(ws.ACT_V, verb):
             return "windows" if target and _known_target(target, router, wn) else None
         if re.match(ws.MIN_V, verb) or re.match(ws.MAX_V, verb):
             return "windows" if not target or ws.ALL_RE.match(rest) or _known_target(target, router, wn) else None
+        if verb.startswith("закр") and not target and not ws.TAB_RE.search(rest):
+            return "windows"                              # 1.0.9: bare «закрой (это/окно)» = the active window
         if verb.startswith(CLOSE_VERBS) and target and _known_target(target, router, wn):
             return "apps"                                 # «закрой ютуб» — always a named target
+    from .skills.files_skill import OPEN_FILE_RE
+    from .skills.core import FOLDERS
+    fm = OPEN_FILE_RE.match(t)
+    if fm and fm.group("q").strip() in FOLDERS:
+        fm = None                                      # «открой папку загрузки» — known folders (old path)
+    if fm:                                             # 1.0.9: «открой файл hello» — only when the file exists
+        fs = getattr(router, "by_name", {}).get("files") if router is not None else None
+        ok = fs is not None and hasattr(fs, "has_match") and fs.has_match(fm.group("q").strip(),
+                                                                          fm.group("kind").startswith("папк"))
+        return "apps" if ok else None
     m = re.match(r"^(открой|запусти|включи|вруби|выключи|выруби)\s+(.+)$", t)
     if m:
         verb, x = m.group(1), m.group(2)
@@ -151,9 +206,15 @@ def _commands(router, hotkeys_skill) -> list:
 def _known_target(x: str, router, wn) -> bool:
     if wn.resolve_alias(x) is not None:
         return True
+    from . import procs
+    if procs.app_key(x):                               # tray apps: «вайфай маус», «стим», «дискорд»
+        return True
     sk = getattr(router, "by_name", {}).get("windows") if router is not None else None
     wm = getattr(sk, "wm", None)
     try:
+        if sk is not None and wm is not None and wm.b is not None and hasattr(sk, "_windows_for") \
+                and sk._windows_for(x)[0]:
+            return True                                 # incl. game windows by launcher name («киберпанк»)
         return bool(wm is not None and wm.b is not None and wm.find_by_name(x))
     except Exception:                                   # noqa: BLE001
         return False
@@ -212,4 +273,27 @@ def decide(text: str, cfg: dict, conf: Optional[tuple], tts_quiet: bool, router:
         return None
     if g == "dictation":
         return FILLER_RE.sub("", text.strip())          # keep Whisper's case/punctuation for typing
+    if g == "search":
+        return search_command(text)                     # canonical: «загугли X» / «найди на ютубе X» (never the LLM)
     return clean(text)
+
+
+# ------------------------------------------------------------------ 1.0.9: cancel while thinking
+CANCEL_RE = re.compile(r"^(?:(?:джарвис|джервис|jarvis)\s+)?(?:стоп|отмена|отмени|отменяй|хватит|забей|не надо)"
+                       r"(?:\s+(?:джарвис|пожалуйста))?$")
+
+
+def is_cancel(text: str, conf: Optional[tuple] = None, min_logprob: float = -0.7, max_nospeech: float = 0.5) -> bool:
+    """Only an exact short cancel phrase with a confident transcription (the user may be talking to someone)."""
+    t = re.sub(r"[^\w\s]", " ", (text or "").lower().replace("ё", "е"))
+    t = re.sub(r"\s+", " ", t).strip()
+    if not CANCEL_RE.match(t):
+        return False
+    if conf:
+        try:
+            lp, ns = float(conf[0]), float(conf[1])
+        except (TypeError, ValueError, IndexError):
+            return True
+        if lp < min_logprob or ns > max_nospeech:
+            return False
+    return True

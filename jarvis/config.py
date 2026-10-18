@@ -32,7 +32,7 @@ DEFAULTS: dict[str, Any] = {
                   "conversation": {"enabled": True, "idle_s": 22},
                   "noname": {"enabled": True, "groups": {g: True for g in (
                       "media", "youtube", "nav", "browser", "windows", "explorer", "keys", "dictation", "apps",
-                      "music", "smarthome")}},
+                      "music", "smarthome", "search")}},
                   "request_timeout_s": 6, "request_silence_ms": 1200, "max_request_s": 15, "tts_tail_ms": 500,
                   "ack_after_s": 2.5},
     "stt": {"model": "small", "device": "cpu", "compute_type": "auto", "language": "ru", "beam_size": 1,
@@ -49,14 +49,15 @@ DEFAULTS: dict[str, Any] = {
             "fx": {"enabled": True, "intensity": 0.35},
             "volume": 1.0, "pyttsx3_rate": 180, "pyttsx3_voice": "", "speak_in_text_mode": True},
     "tools": {"enabled": True, "websites": {}, "apps": {}},
-    "windows": {"enabled": True},
+    "windows": {"enabled": True, "never_close": []},
     "explorer": {"enabled": True},
+    "view": {"enabled": True},                 # 1.0.9 «полный экран», «кинотеатр», «субтитры»
     "hotkeys": {"enabled": True},
     "nav": {"enabled": True},
     "chat": {"enabled": True},              # module switch; the user toggle is assistant.conversation.enabled
     "keys": {"enabled": True},
     "gui": {"enabled": True, "always_on_top": False, "start_minimized": False, "close_to_tray": True,
-            "hotkey_show": "ctrl+alt+j", "hotkey_ptt": "ctrl+alt+space", "hotkey_game": "ctrl+alt+g", "fps": None},
+            "hotkey_show": "ctrl+alt+j", "hotkey_ptt": "ctrl+alt+space", "hotkey_game": "ctrl+alt+g", "hotkey_stop": "ctrl+alt+x", "fps": None},
     "load": {"preset": "balanced", "log_every_s": 300},
     "autostart": {"enabled": True},
     "logging": {"level": "INFO", "file": "logs/jarvis.log"},
@@ -86,7 +87,8 @@ def _read_yaml(path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
-CONFIG_VERSION = 8
+CONFIG_VERSION = 9
+MIGRATION_NOTICES: list[str] = []      # shown once by the assistant after start (1.0.9)
 OLD_PROMPT = "Джарвис, привет. Джарвис, включи музыку."
 REMOVED_SECTIONS = ("whatsapp", "comfyui", "faceswap", "video")
 
@@ -169,6 +171,16 @@ def migrate_local(data) -> tuple[dict, bool]:
             for k in ("OLLAMA_FLASH_ATTENTION", "OLLAMA_KV_CACHE_TYPE"):
                 oc["server_env"].pop(k, None)      # garbage output on GTX 16xx (users' logs) -> safe defaults
         data["config_version"] = 8
+        changed = True
+    if ver < 9:                                   # 1.0.9: «Оперативка» was picked as a 1.0.7-crash workaround (cublas)
+        llm = data.get("llm")  # type: ignore[assignment]
+        if isinstance(llm, dict) and str(llm.get("placement", "")).strip().lower() == "cpu":
+            llm["placement"] = "gpu"              # -> num_gpu=0 on every load, ~28 tok/s prompt (user's server.log)
+            MIGRATION_NOTICES.append("ИИ снова работает на видеокарте (раньше в настройках стояло «Оперативка» — "
+                                     "ответы были в 5–10 раз медленнее). Вернуть можно в Настройки → ИИ → "
+                                     "«Где работает ИИ».")
+            log.warning("Миграция 1.0.9: llm.placement cpu -> gpu")
+        data["config_version"] = 9
         changed = True
     return data, changed
 

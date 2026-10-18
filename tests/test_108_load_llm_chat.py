@@ -17,7 +17,7 @@ CONF = (-0.2, 0.05)
 def test_presets_default_keeps_7b_and_explicit_values_win():
     c = C.apply_load_preset({})
     assert c["llm"]["model"] if "model" in c["llm"] else True
-    assert c["llm"]["num_ctx"] == 4096 and c["llm"]["keep_alive"] == "5m" and c["llm"]["num_thread"] == 4
+    assert c["llm"]["num_ctx"] == 4096 and c["llm"]["keep_alive"] == "24h" and c["llm"]["num_thread"] == 4
     assert c["stt"]["cpu_threads"] == 4 and c["gui"]["fps"] == 30 and c["llm"]["tools"] == "core"
     assert "model" not in c["llm"]                                         # 7b stays (from config/defaults)
     light = C.apply_load_preset({"load": {"preset": "light"}, "llm": {"model": "qwen2.5:7b"}})
@@ -94,8 +94,8 @@ def test_low_memory_blocks_llm_instead_of_silent_spill(monkeypatch):
     with pytest.raises(L.LLMError):
         list(c.stream("привет"))
     monkeypatch.setattr(resources, "free_ram_gb", lambda: 12.0)
-    assert c.ensure_fit(force=True) == "" and c.num_gpu is not None
-    assert c.options()["num_gpu"] == c.num_gpu
+    assert c.ensure_fit(force=True) == "" and c.num_gpu is None          # 1.0.9: Ollama places the layers
+    assert "num_gpu" not in c.options()
 
 
 def test_tok_s_is_not_reported_for_tiny_answers():

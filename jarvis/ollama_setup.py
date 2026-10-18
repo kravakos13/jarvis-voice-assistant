@@ -209,6 +209,11 @@ def _serve_env(host: str, extra: Optional[dict] = None, force_safe: bool = False
             env[str(k)] = str(v)
     if force_safe:
         env.update({k: SERVER_ENV[k] for k in SAFE_KEYS})
+    # 1.0.9: Whisper's pip CUDA DLL dirs (cuda_libs) must not shadow Ollama's own CUDA runtime
+    parts = [p for p in env.get("PATH", "").split(os.pathsep)
+             if not ("site-packages" in p.lower() and "nvidia" in p.lower())]
+    if parts:
+        env["PATH"] = os.pathsep.join(parts)
     port = urllib.parse.urlparse(host).port
     if port and port != 11434:
         env["OLLAMA_HOST"] = f"127.0.0.1:{port}"

@@ -16,7 +16,8 @@ COMMAND_VERBS = {"нажми", "сверни", "разверни", "перекл
 # real words that are 1 edit away from a command verb: never "repair" them («запиши заметку» must stay a note, not
 # become «напиши …» and get typed into the window)
 REAL_WORDS = {"запиши", "запомни", "напомни", "покажи", "скажи", "найди", "пришли", "допиши", "спиши", "впиши",
-              "открою", "закрою", "включу", "выключу", "пишу", "запустил", "обновить", "ставь", "отмена", "пуск"}
+              "открою", "закрою", "включу", "выключу", "пишу", "запустил", "обновить", "ставь", "отмена", "пуск",
+              "ключи", "ключ", "клички", "кличи"}           # 1.0.9: «найди ключи» is not «включи найди»
 TAIL_VERBS = ("открой", "закрой", "включи", "выключи", "переключи", "переключись", "сверни", "разверни", "нажми")
 
 
@@ -62,7 +63,8 @@ def variants(t: str) -> Iterator[str]:
         if r := out(" ".join([v] + toks[1:])):                     # «нашми энтер» -> «нажми энтер»
             yield r
     last = near_verb(toks[-1])
-    if len(toks) >= 2 and last in TAIL_VERBS:
+    first_is_verb = toks[0] in VERBS or toks[0] in REAL_WORDS or bool(near_verb(toks[0]))
+    if len(toks) >= 2 and last in TAIL_VERBS and not first_is_verb:
         if r := out(" ".join([last] + toks[:-1])):                 # «первая вкладка открой»
             yield r
     if len(toks) >= 2 and len(toks[0]) <= 3 and not near_verb(toks[0]):

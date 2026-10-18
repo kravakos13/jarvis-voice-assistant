@@ -177,7 +177,7 @@ def test_close_active_foreground():
 def test_never_closes_jarvis_shell_system():
     sk, b = make(fg=1)
     r = sk.match("закрой окно", "закрой окно")
-    assert b.closed == [] and "Не понял, какое окно" in r.reply
+    assert b.closed == [] and "какое окно закрыть" in r.reply
     assert sk.match("закрой джарвис", "закрой джарвис").reply.startswith("Себя я так не закрываю")
     for w in desktop():
         if w.hwnd in (1, 7, 9):
@@ -191,7 +191,7 @@ def test_not_found_and_unsaved_dialog():
     assert r.reply == "Не вижу открытого окна «Дискорд»." and b.closed == []
     sk, b = make(dialog=(6,))
     r = sk.match("закрой блокнот", "закрой блокнот")
-    assert "спрашивает, сохранить ли изменения" in r.reply and b.killed == []
+    assert "просит сохранить изменения" in r.reply and b.killed == []
 
 
 def test_unresponsive_app_falls_back_to_taskkill_pid():

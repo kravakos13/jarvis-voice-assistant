@@ -172,6 +172,7 @@ def main() -> int:
     ap.add_argument("--core-only", action="store_true", help="только базовые пакеты (тест)")
     ap.add_argument("--no-ollama", action="store_true")
     ap.add_argument("--no-models", action="store_true")
+    ap.add_argument("--pause-on-error", action="store_true", help="интерактивная установка: ждать Enter при ошибках")
     a = ap.parse_args()
     log(f"=== Установка Джарвиса в {ROOT} (Python {sys.version.split()[0]}) ===")
     ok = True
@@ -188,7 +189,31 @@ def main() -> int:
             ok = False
             log(f"[!] Ollama: {e}")
     log("=== Готово ===" if ok else "=== Готово с предупреждениями (см. выше) ===")
+    if not ok and a.pause_on_error:
+        pause_with_help()
     return 0
+
+
+def pause_with_help(timeout_s: float = 600.0) -> None:
+    """1.0.9: plain words for beginners; the window waits (max 10 min) so the messages above can be read."""
+    print()
+    print("Что-то скачалось не до конца (обычно из-за интернета). Ничего страшного:")
+    print("  * Джарвис сам предложит докачать недостающее при первом запуске;")
+    print("  * или потом: Пуск -> Джарвис -> «Докачать компоненты».")
+    print(f"Подробности записаны в файл: {ROOT / 'logs' / 'install.log'}")
+    print()
+    print("Нажми Enter, чтобы закрыть это окно и продолжить установку.")
+    import threading
+    t = threading.Thread(target=lambda: _safe_input(), daemon=True)
+    t.start()
+    t.join(timeout_s)
+
+
+def _safe_input() -> None:
+    try:
+        input()
+    except Exception:                            # noqa: BLE001 — no console (silent / redirected)
+        pass
 
 
 if __name__ == "__main__":

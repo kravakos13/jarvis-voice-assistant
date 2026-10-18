@@ -129,6 +129,10 @@ class Assistant:
         self._stt_last: Optional[tuple[float, float]] = None     # (start, seconds) of the last transcription
         self._ack_text = ""
         self.llm.warm_tools = self.router.tool_schemas() if self.tool_calling else None
+        from . import config as _config
+        for note in _config.MIGRATION_NOTICES:
+            self.emit("notice", text=note)
+        _config.MIGRATION_NOTICES.clear()
         self.router.ctx.extra["stt_conf"] = lambda: getattr(self.stt, "last_conf", None)
         if self.llm.placement == "cpu":
             self.llm.on_cpu = True
@@ -422,6 +426,10 @@ class Assistant:
     def submit(self, text: str, source: str = "text", trace: Optional[Trace] = None) -> None:
         """Queue a user command (from the GUI text box, voice loop, or console)."""
         if text and text.strip():
+            if source not in ("voice", "noname"):
+                wm = self._wm()
+                if wm is not None:
+                    wm.clear_utterance()             # typed in Jarvis's window: «закрой» = the user's last window
             self._idle.clear()
             self._commands.put((text.strip(), source, trace))
 
@@ -504,6 +512,58 @@ class Assistant:
     def wait_idle(self, timeout: Optional[float] = None) -> bool:
         return self._idle.wait(timeout)
 
+    # ------------------------------------------------------------ 1.0.9: cancel thinking / speech
+    _cancel_req: Optional[str] = None       # set while a cancelled turn unwinds; the text is said afterwards
+
+    def busy(self) -> bool:
+        return not self._idle.is_set()
+
+    def cancel_current(self, reply: str = "Ок, отменил.", source: str = "voice") -> bool:
+        """Stop thinking and speaking right now (voice «стоп» while thinking, hotkey, tray «Остановить»).
+        The LLM request is aborted, pending speech dropped; `reply` is said once the turn has unwound.
+        Returns False when there was nothing to stop."""
+        sp = self.speaker
+        speaking = bool(sp is not None and sp.active())
+        if not self.busy() and not speaking:
+            return False
+        log.info("Отмена (%s): %s", source, "думаю" if self.busy() else "говорю")
+        if sp is not None:
+            sp.hush()
+        try:
+            self.llm.cancel()
+        except Exception as e:                                  # noqa: BLE001
+            log.debug("llm.cancel: %s", e)
+        if self.busy():
+            self._cancel_req = reply
+            threading.Thread(target=self._cancel_watch, name="jarvis-cancel", daemon=True).start()
+        else:                                                   # only speech was running: done right away
+            if sp is not None:
+                sp.unhush()
+        self.emit("state", state="idle" if not self.busy() else "thinking")
+        return True
+
+    def _cancel_watch(self, limit_s: float = 8.0) -> None:
+        """llm.stream() clears its cancel flag when it starts: keep re-asserting until the turn ends; never let
+        the hush outlive the turn (watchdog)."""
+        end = time.monotonic() + limit_s
+        while self.busy() and time.monotonic() < end and self._cancel_req is not None:
+            try:
+                self.llm.cancel()
+            except Exception:                                   # noqa: BLE001
+                pass
+            if self._idle.wait(0.25):
+                break
+        if not self.busy():
+            self._finish_cancel()                               # idempotent; the brain loop normally did it
+
+    def _finish_cancel(self) -> None:
+        msg, self._cancel_req = self._cancel_req, None
+        sp = self.speaker
+        if sp is not None and sp.hushed:
+            sp.unhush()
+            if msg:
+                sp.say(msg)
+
     def _brain_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -527,6 +587,8 @@ class Assistant:
             finally:
                 if ack is not None:
                     ack.cancel()
+                if self._cancel_req is not None:
+                    self._finish_cancel()             # «Ок, отменил.» after the aborted answer unwound
                 if self.speaker:
                     self.speaker.wait()
                 self._trace = None
@@ -544,7 +606,13 @@ class Assistant:
 
     def _respond_silent(self, text: str) -> None:
         """No-name command: fast path only (never the LLM), no voice reply, never «exit»."""
-        r = self.router.handle(text)
+        ex = getattr(getattr(self.router, "ctx", None), "extra", None)
+        ex = ex if isinstance(ex, dict) else {}
+        ex["noname"] = True                          # skills keep refusals silent («Игры не закрываю» etc.)
+        try:
+            r = self.router.handle(text)
+        finally:
+            ex["noname"] = False
         if r is None:
             log.debug("Без имени: никто не взял %r — молчу", text)
             return
@@ -552,6 +620,8 @@ class Assistant:
         self.emit("noname", text=text)                          # face flash
         if r.reply:
             log.info("Без имени выполнено: %s → %s", text, r.reply)
+            if getattr(r, "noname_say", False):
+                self.say(r.reply)                               # e.g. «Игру закрою только по имени…»
         if r.then:
             def job():
                 try:
@@ -562,12 +632,30 @@ class Assistant:
                     log.exception("action: %s", e)
             threading.Thread(target=job, daemon=True).start() if r.background else job()
 
+    def _report_placement(self) -> None:
+        """1.0.9: log where Ollama really put the model; a CUDA GPU with 0 % of the model = loud warning."""
+        try:
+            line, warn = self.llm.placement_report()
+        except Exception as e:                                  # noqa: BLE001
+            log.debug("placement: %s", e)
+            return
+        if not line:
+            return
+        if not warn:
+            log.info("%s", line)
+            return
+        log.warning("%s — видеокарта есть, но Ollama её не использует: ответы будут в 5–10 раз медленнее. "
+                    "Скажи «собери диагностику» и пришли архив.", line)
+        self.emit("notice", text="ИИ работает без видеокарты — ответы медленные. Обнови Ollama и драйвер NVIDIA; "
+                                 "«Джарвис, собери диагностику» сложит логи на рабочий стол.")
+
     def _warm_and_check(self) -> None:
         """1.0.8: warm the model, then a tiny self-test. Garbage (CJK / no Cyrillic, seen on GTX 1660 Super with
         flash attention + q8 KV) -> restart Ollama with safe settings and test again; still bad -> tell the user."""
         from . import ollama_setup
         if self.llm.warm(self.llm.warm_tools) is None:
             return
+        self._report_placement()
         if not (self.cfg.get("ollama") or {}).get("selftest", True):
             return
         if self.llm.selftest() != "garbage":
@@ -794,7 +882,7 @@ class Assistant:
             yield frame
 
     def _listen(self, mic, vad, timeout: Optional[float] = None, abort: Optional[Callable[[], bool]] = None,
-                silence_ms: Optional[int] = None, max_s: Optional[float] = None):
+                silence_ms: Optional[int] = None, max_s: Optional[float] = None, track: bool = True):
         from .audio import segment_utterance
         a = self.cfg["audio"]
         deadline = time.monotonic() + timeout if timeout else None
@@ -803,18 +891,58 @@ class Assistant:
             return (self.stop_event.is_set() or (deadline is not None and time.monotonic() > deadline)
                     or (abort is not None and abort()))
 
-        return segment_utterance(
+        wm = self._wm() if track else None             # cancel listening must not move the «закрой» snapshot
+        audio = segment_utterance(
             self._frames(mic), vad, mic.rate,
             frame_ms=int(a.get("frame_ms", 30)), silence_ms=int(silence_ms or a.get("silence_ms", 800)),
             min_speech_ms=int(a.get("min_speech_ms", 250)), max_utterance_s=float(max_s or a.get("max_utterance_s", 15)),
-            pre_roll_ms=int(a.get("pre_roll_ms", 300)), should_stop=should_stop)
+            pre_roll_ms=int(a.get("pre_roll_ms", 300)), should_stop=should_stop,
+            on_start=wm.mark_start if wm is not None else None)
+        if audio is not None and wm is not None:
+            wm.commit_utterance()                    # this utterance's «what was in front» (bare «закрой»)
+        return audio
 
-    def _execute_voice(self, mic, command: str) -> None:
+    def _wm(self):
+        router = getattr(self, "router", None)
+        extra = getattr(getattr(router, "ctx", None), "extra", None)
+        wm = extra.get("wm") if isinstance(extra, dict) else None
+        return wm if wm is not None and hasattr(wm, "mark_start") else None
+
+    def _execute_voice(self, mic, command: str, vad=None) -> None:
         print(f"Ты: {command}")
         self.submit(command, "voice", self._voice_trace(command))
-        if not self.wait_idle(self.STUCK_S * 2):
+        if vad is not None and (self.cfg.get("assistant") or {}).get("voice_cancel", True):
+            self._listen_for_cancel(mic, vad, self.STUCK_S * 2)
+        elif not self.wait_idle(self.STUCK_S * 2):
             log.warning("Команда «%s» выполняется > %.0f с — продолжаю слушать", command[:60], self.STUCK_S * 2)
         mic.clear()
+
+    def _listen_for_cancel(self, mic, vad, limit_s: float) -> None:
+        """1.0.9: while the command is processed (thinking, «Секунду»), keep listening — but ONLY a confident
+        «стоп / отмена / хватит / забей / не надо» counts; anything else is ignored. While Jarvis speaks the mic
+        hears silence (_frames), so its own voice can't cancel; the stop hotkey / tray item covers that."""
+        from .noname import is_cancel
+        end = time.monotonic() + limit_s
+        self._idle.wait(0.05)
+        while self.busy() and not self.stop_event.is_set():
+            if time.monotonic() > end:
+                log.warning("Команда выполняется > %.0f с — продолжаю слушать", limit_s)
+                return
+            audio = self._listen(mic, vad, abort=lambda: not self.busy(), silence_ms=400, max_s=3.0, track=False)
+            if audio is None or not self.busy():
+                continue
+            try:
+                text = self._transcribe(audio, language="ru")
+            except Exception as e:                              # noqa: BLE001
+                log.debug("cancel STT: %s", e)
+                continue
+            conf = getattr(self.stt, "last_conf", None)
+            if is_cancel(text, conf):
+                log.info("Голосовая отмена: %r conf=%s", text, conf)
+                self.cancel_current(source="голос")
+                self.wait_idle(10)
+                return
+            log.info("Во время размышления услышал %r — не отмена, игнорирую", (text or "")[:60])
 
     def ptt_press(self) -> None:
         self._ptt_active.set()
@@ -833,7 +961,7 @@ class Assistant:
                 mic, vad, timeout=timeout, silence_ms=silence_ms, max_s=max_s, abort=lambda: self.mode != "wake"),
             transcribe=lambda audio: self._transcribe(audio, language=self.router.stt_language()),
             say=say,
-            execute=lambda command: self._execute_voice(mic, command),
+            execute=lambda command: self._execute_voice(mic, command, vad),
             emit=lambda st: self.emit("state", state="muted" if self.mic_muted else st),
             awaiting=lambda: bool(self.router.awaiting_input),
             awaiting_timeout=lambda: self.router.awaiting_timeout,
@@ -980,6 +1108,10 @@ class Assistant:
                         mic.clear()
                         continue
                     self.emit("state", state="listening")
+                    wm = self._wm()
+                    if wm is not None:                       # PTT: «закрой» = the window in front when pressed
+                        wm.mark_start()
+                        wm.commit_utterance()
                     mic.clear()
                     chunks = []
                     for frame in self._frames(mic):

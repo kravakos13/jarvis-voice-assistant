@@ -297,9 +297,11 @@ class Controller(QObject):
         m.addSeparator()
         m.addAction("Открыть папку Jarvis", lambda: pu.open_path(pu.data_dir("")))
         m.addAction("Настройки...", self.open_settings)
+        m.addAction("Остановить (замолчать)", self.stop_now)
         m.addAction("Перезапустить прослушку", self.restart_listening)
         m.addAction("Синхронизировать", self.sync_now)
         m.addAction("Самодиагностика", self.run_diagnostics)
+        m.addAction("Собрать диагностику (архив)", self.collect_diagnostics)
         m.addAction("Проверить обновления", lambda: self.check_updates(manual=True))
         m.addAction("Инструкция", self.open_manual)
         m.addSeparator()
@@ -958,6 +960,7 @@ class Controller(QObject):
         g = self.cfg["gui"]
         for hk, fn in ((g.get("hotkey_show", "ctrl+alt+j"), lambda: self.emit_from_thread("show")),
                        (g.get("hotkey_mic", "ctrl+alt+m"), lambda: self.emit_from_thread("toggle_mic")),
+                       (g.get("hotkey_stop", "ctrl+alt+x"), self.stop_now),
                        (self.cfg.get("dictate", {}).get("hotkey", "ctrl+alt+d"), self._toggle_dictation)):
             if not hk:
                 continue
@@ -966,6 +969,25 @@ class Controller(QObject):
             except Exception as e:
                 log.warning("Горячая клавиша %s не зарегистрирована: %s", hk, e)
         return True
+
+    def collect_diagnostics(self) -> None:
+        def work():
+            from .. import diagbundle
+            try:
+                path = diagbundle.collect(self.cfg, self.assistant)
+                self.emit_from_thread("notice", text=f"Архив диагностики: {path}")
+                pu.open_path(path.parent)
+            except Exception as e:                       # noqa: BLE001
+                self.emit_from_thread("notice", text=f"Не получилось собрать диагностику: {e}")
+        threading.Thread(target=work, name="jarvis-diag-zip", daemon=True).start()
+
+    def stop_now(self) -> None:
+        """1.0.9: hotkey / tray «Остановить» — stop speaking and thinking immediately (works while Jarvis speaks,
+        when the mic is deaf to its own voice)."""
+        a = self.assistant
+        if a is None:
+            return
+        threading.Thread(target=lambda: a.cancel_current(reply="", source="клавиша/трей"), daemon=True).start()
 
     def _toggle_dictation(self) -> None:
         a = self.assistant

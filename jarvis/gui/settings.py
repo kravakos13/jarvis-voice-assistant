@@ -40,7 +40,7 @@ MODULES = [("memory", "Долговременная память"), ("planner", 
            ("dictate", "Диктовка в любое окно"), ("monitor", "Температура ПК"), ("alerts", "Воздушные тревоги"),
            ("profiles", "Режимы (игровой/ночной)"), ("audio_devices", "Переключение аудиоустройств"),
            ("files", "Поиск файлов"), ("calc", "Калькулятор"), ("clipboard", "Буфер обмена"),
-           ("diagnostics", "Самодиагностика")]
+           ("diagnostics", "Самодиагностика"), ("view", "Полный экран / кинотеатр / субтитры в YouTube")]
 
 # changes under these keys need a restart
 RESTART_KEYS = ("sync.", "stt.", "audio.", "tts.piper_voice", "tts.engine", "llm.host", "telegram.", "alerts.backend",
@@ -355,12 +355,17 @@ class SettingsDialog(QDialog):
                   tip="Начинается фразами «давай поболтаем», «расскажи что-нибудь», «как дела». Заканчивается словами "
                       "«хватит болтать», «пока», «спасибо, всё», «тихо» или после тишины.")
         self._add(fn, "assistant.conversation.idle_s", "Беседа: выйти после тишины", "int", min=10, max=120, suffix=" с")
+        fw = self._group(v, "Закрытие окон")
+        self._add(fw, "windows.never_close", "Не закрывать (exe или слово из заголовка, по одному в строке)", "list",
+                  height=60, tip="«Закрой» без названия закрывает активное окно. Игры не закрываются никогда "
+                                 "(Steam/Epic/GOG/Riot/Battle.net, полноэкранные, игровой режим); сюда добавь, что ещё "
+                                 "не трогать, например obs64.exe или Ableton.")
         from ..resources import PRESET_NAMES
         fl = self._group(v, "Нагрузка на компьютер")
         self._add(fl, "load.preset", "Нагрузка", "combo", options=list(PRESET_NAMES.items()),
-                  tip="Обычная: модель qwen2.5:7b, 4 потока, ИИ выгружается из памяти через 5 мин простоя, приоритет "
-                      "ниже обычного. Лёгкая: модель qwen2.5:3b (~2 ГБ) — легче для слабых ПК и игр, ответы проще. "
-                      "Максимальная: все ядра, модель держится 30 мин, обычный приоритет (как в 1.0.7).")
+                  tip="Обычная: модель qwen2.5:7b, 4 потока, модель остаётся в памяти (быстрый ответ; в игровом режиме "
+                      "выгружается), приоритет ниже обычного. Лёгкая: модель qwen2.5:3b (~2 ГБ) — для слабых ПК и игр, "
+                      "ответы проще, выгружается через 5 мин простоя. Максимальная: все ядра, обычный приоритет.")
         self._add(fl, "ollama.fast_kv", "Экономия видеопамяти (flash attention + KV q8) — только для RTX", "bool",
                   tip="На GTX 16xx/10xx и на процессоре из-за этого ИИ отвечал «китайским мусором». По умолчанию выкл.")
         self._add(fl, "ollama.selftest", "Самопроверка ИИ после запуска (мусор -> перезапуск Ollama)", "bool")
@@ -444,6 +449,7 @@ class SettingsDialog(QDialog):
         self._add(f3, "gui.hotkey_ptt", "Говорить (удерживать)", "hotkey")
         self._add(f3, "gui.hotkey_mic", "Пауза микрофона", "hotkey")
         self._add(f3, "gui.hotkey_show", "Показать/скрыть окно", "hotkey")
+        self._add(f3, "gui.hotkey_stop", "Остановить (замолчать, бросить ответ)", "hotkey")
         self._add(f3, "gui.hotkey_game", "Вопрос по игре (удерживать)", "hotkey")
         self._add(f3, "dictate.hotkey", "Диктовка в окно", "hotkey")
         v.addStretch(1)
@@ -993,7 +999,7 @@ class SettingsDialog(QDialog):
             errs.append("alerts.in.ua: нужен токен (или выбери «Авто»)")
         hk = {"Говорить": get_path(ch, "gui.hotkey_ptt"), "Пауза микрофона": get_path(ch, "gui.hotkey_mic"),
               "Показать окно": get_path(ch, "gui.hotkey_show"), "Вопрос по игре": get_path(ch, "gui.hotkey_game"),
-              "Диктовка": get_path(ch, "dictate.hotkey")}
+              "Диктовка": get_path(ch, "dictate.hotkey"), "Остановить": get_path(ch, "gui.hotkey_stop")}
         errs += hotkey_conflicts(hk)
         y = self._check_yaml(self.devices_edit.toPlainText())
         if y:

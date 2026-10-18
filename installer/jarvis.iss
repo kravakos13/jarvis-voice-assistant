@@ -38,10 +38,14 @@ MinVersion=10.0
 [Languages]
 Name: "ru"; MessagesFile: "compiler:Languages\Russian.isl"
 
+[Messages]
+ru.WelcomeLabel2=Сейчас на компьютер установится голосовой помощник Джарвис.%n%nПрава администратора не нужны.%nУстановщик сам скачает голос, распознавание речи и ИИ (всего около 6–7 ГБ). На быстром интернете это 10–20 минут, на медленном — дольше. Компьютером в это время можно пользоваться.%n%nНажми «Далее».
+ru.FinishedLabel=Готово! Джарвис запускается: справа внизу, возле часов, появится его значок (если не видно — нажми стрелочку ^ возле часов). Первый запуск занимает до минуты.%n%nПроверка: скажи «Джарвис, привет».%nИнструкция: Пуск → Джарвис → Инструкция.
+
 [CustomMessages]
 ru.Autostart=Запускать Джарвиса вместе с Windows
 ru.Desktop=Ярлык на рабочем столе
-ru.Deps=Скачать компоненты (Python-пакеты, голос, распознавание, Ollama и модели ИИ) — нужен интернет, несколько ГБ
+ru.Deps=Скачать голос, распознавание речи и ИИ (нужен интернет, около 6–7 ГБ). Оставь галочку — без этого Джарвис не заработает
 ru.DepsStatus=Скачиваю компоненты Джарвиса (окно консоли покажет прогресс, это может занять 10–40 минут)...
 ru.Launch=Запустить Джарвиса
 
@@ -74,7 +78,7 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\python\pythonw.exe"; Paramete
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Jarvis"; ValueData: """{sys}\wscript.exe"" ""{app}\Jarvis.vbs"" --minimized"; Flags: uninsdeletevalue; Tasks: autostart
 
 [Run]
-Filename: "{app}\python\python.exe"; Parameters: "installer\postinstall.py"; WorkingDir: "{app}"; StatusMsg: "{cm:DepsStatus}"; Tasks: deps; Check: not SkipDeps
+Filename: "{app}\python\python.exe"; Parameters: "installer\postinstall.py {code:PauseArg}"; WorkingDir: "{app}"; StatusMsg: "{cm:DepsStatus}"; Tasks: deps; Check: not SkipDeps
 Filename: "{app}\python\pythonw.exe"; Parameters: "-m jarvis.watchdog"; WorkingDir: "{app}"; Description: "{cm:Launch}"; Flags: postinstall nowait skipifsilent
 
 [UninstallRun]
@@ -91,6 +95,12 @@ Type: filesandordirs; Name: "{app}\wheels"
 Type: files; Name: "{app}\settings.local.yaml.broken"
 
 [Code]
+function PauseArg(Param: String): String;
+begin
+  { interactive install: on download problems the console waits, so the user can read what went wrong }
+  if WizardSilent then Result := '' else Result := '--pause-on-error';
+end;
+
 function SkipDeps: Boolean;
 begin
   { /SKIPDEPS=1 — used by tests and by updates when components are already installed }

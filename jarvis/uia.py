@@ -286,3 +286,53 @@ def media_playing(threshold: float = 0.002) -> Optional[bool]:
     except Exception as e:                      # noqa: BLE001
         log.debug("audio meter: %s", e)
         return None
+
+
+def close_window(hwnd: int) -> bool:
+    """WindowPattern.Close through UI Automation (fallback for Store apps that ignore WM_CLOSE)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        UIA, auto = _uia()
+        el = auto.ElementFromHandle(hwnd)
+        el.GetCurrentPattern(UIA.UIA_WindowPatternId).QueryInterface(UIA.IUIAutomationWindowPattern).Close()
+        return True
+    except Exception as e:                      # noqa: BLE001
+        log.debug("UIA close: %s", e)
+        return False
+
+
+def focus_in_edit() -> Optional[bool]:
+    """True if keyboard focus is in a text box (YouTube search), None if unknown."""
+    if sys.platform != "win32":
+        return None
+    try:
+        UIA, auto = _uia()
+        el = auto.GetFocusedElement()
+        return bool(el) and int(el.CurrentControlType) in (UIA.UIA_EditControlTypeId, UIA.UIA_ComboBoxControlTypeId)
+    except Exception as e:                      # noqa: BLE001
+        log.debug("UIA focus: %s", e)
+        return None
+
+
+PLAYER_NAMES = ("youtube video player", "видеопроигрыватель youtube", "проигрыватель youtube", "видеоплеер youtube")
+
+
+def focus_player(hwnd: int) -> bool:
+    """Give keyboard focus to YouTube's player (no mouse click): UIA SetFocus on the «YouTube Video Player» group."""
+    if sys.platform != "win32":
+        return False
+    try:
+        UIA, auto = _uia()
+        root = auto.ElementFromHandle(hwnd)
+        arr = root.FindAll(UIA.TreeScope_Descendants, auto.CreatePropertyCondition(
+            UIA.UIA_ControlTypePropertyId, UIA.UIA_GroupControlTypeId))
+        for i in range(arr.Length if arr else 0):
+            el = arr.GetElement(i)
+            name = str(el.CurrentName or "").lower()
+            if any(n in name for n in PLAYER_NAMES) or str(el.CurrentAutomationId or "") == "movie_player":
+                el.SetFocus()
+                return True
+    except Exception as e:                      # noqa: BLE001
+        log.debug("UIA player focus: %s", e)
+    return False

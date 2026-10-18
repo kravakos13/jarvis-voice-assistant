@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Callable, Optional
 import threading
 import time
@@ -276,7 +277,7 @@ def accept(segments, prompt: str | None = None, hotwords: str | None = None) -> 
         kept.append(t)
         conf.append(lp)
         nos.append(ns)
-    text = " ".join(kept).strip()
+    text = strip_sound_tags(" ".join(kept).strip())
     if not text:
         return ""
     plain = _plain(text)
@@ -303,6 +304,30 @@ _HALLUCINATIONS = (
     "ставьте лайки", "до новых встреч", "amara org", "субтитры от", "игорь негода", "а семкин", "с вами был",
     "спасибо что смотрите", "всем пока", "благодарю за внимание",
 )
+
+
+_TAG_WORDS = ("музык", "аплодисмент", "смех", "шум", "тишин", "мелоди", "песн", "вздох", "кашл", "звонок",
+              "динамичн", "спокойн", "весел", "грустн", "напряж", "торжествен", "рингтон", "стук", "крик", "плач",
+              "гудок", "сигнал", "играет", "звучит", "music", "applause", "laughter", "noise", "silence")
+
+
+def strip_sound_tags(text: str) -> str:
+    """1.0.9: subtitle sound tags Whisper hallucinates on noise/music: «[МУЗЫКА]», «(смех)», «ДИНАМИЧНАЯ МУЗЫКА»,
+    «АПЛОДИСМЕНТЫ». Bracketed tags are removed; an ALL-CAPS utterance (people's speech never comes out in caps)
+    or a phrase made only of tag words is dropped."""
+    t = re.sub(r"[\[(*♪♫][^\])*♪♫]{0,40}[\])*♪♫]", " ", text)
+    t = re.sub(r"[♪♫]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip(" .,!?-—")
+    letters = re.sub(r"[^A-Za-zА-Яа-яЁё]", "", t)
+    words = re.findall(r"[a-zа-яё]+", t.lower())
+    tagged = [w for w in words if w.startswith(_TAG_WORDS)]
+    if len(letters) >= 4 and letters.isupper() and (len(words) >= 2 or tagged):
+        return ""                                    # «ДИНАМИЧНАЯ МУЗЫКА», «АПЛОДИСМЕНТЫ»
+    glue = ("в", "зале", "за", "кадром", "на", "фоне")
+    if words and all(w in tagged or w in glue for w in words):
+        if len(words) >= 2 or words[0].startswith(("аплодисмент", "смех", "тишин", "шум", "applause", "laughter")):
+            return ""                                # «динамичная музыка», «смех в зале»; «музыка» alone stays
+    return t if t != text.strip(" .,!?-—") else text
 
 
 def _drop_hallucinations(text: str) -> str:

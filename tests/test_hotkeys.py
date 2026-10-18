@@ -66,7 +66,9 @@ def test_open_site_and_ninth_tab_limit(monkeypatch):
     assert run(sk, "открой сайт хабр") == "Открываю хабр." and "ducky" in opened[-1]
     run(sk, "открой сайт ru.wikipedia.org")
     assert opened[-1] == "https://ru.wikipedia.org"
-    assert "восьмую" in run(sk, "двенадцатая вкладка")
+    keys.clear()
+    run(sk, "двенадцатая вкладка")                      # 1.0.9: >8 = Ctrl+1, then Ctrl+Tab ×11
+    assert keys == ["ctrl+1"] + ["ctrl+tab"] * 11
 
 
 GOOGLE = [

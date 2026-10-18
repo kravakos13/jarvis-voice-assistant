@@ -12,11 +12,12 @@ from typing import Optional
 
 from .. import platform_utils as pu
 from .. import windows as wn
-from .base import Skill, ToolResult, fn, s
+from .. import games, procs
+from .base import Confirm, Skill, ToolResult, fn, s
 
 log = logging.getLogger(__name__)
 
-CLOSE_V = (r"закрой|закрои|закрою|закройте|закрывай|закрыть|закрой ка|выруби|вырубай|вырубить|вырубите|выключи|"
+CLOSE_V = (r"закрой|закрои|закрою|закройте|закрывай|закрыть|закрой ка|закрыл|закрыла|закроем|закрывайте|выруби|вырубай|вырубить|вырубите|выключи|"
            r"выключай|убей|прибей|грохни|убери")
 MIN_V = (r"сверни|свернуть|сверни ка|сверните|спрячь|скрой|"
          r"сюрни|свирни|сверне|зверни|сверли|свёрни|сварни|сверний|сверну")      # Whisper typos (user log: «Сюрни Хром»)
@@ -42,6 +43,31 @@ NOT_WINDOWS = re.compile(r"^(звук\w*|компьютер|комп|пк|сис
 SELF_RE = re.compile(r"^(себя|джарвис\w*|ассистент\w*|сам\w*)$")
 ALL_RE = re.compile(r"^(все|всё)( окна)?$")
 TAB_RE = re.compile(r"\bвкладк\w*\b")
+SPLIT_RE = re.compile(r"^(закрой|сверни|разверни)(?!те\b|ка\b)([а-я]{1,3})\s+([а-я]{3,})")   # «закройки берпанк»
+GAME_RE = re.compile(r"^(?:текущую |эту |мою |открытую )?(?:игру|игрушку|игруху|игра)$")
+ALL_MOD = re.compile(r"\b(?:весь|всю|вся|все|всё|полностью|целиком)\b")
+ALL_NOISE = {"окна", "окон", "окошки", "вкладки", "вкладок", "вкладку", "его", "её", "ее"}
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    n100, n10 = n % 100, n % 10
+    return one if n10 == 1 and n100 != 11 else few if 2 <= n10 <= 4 and not 12 <= n100 <= 14 else many
+
+
+def genitive(label: str) -> str:
+    """«проводник» -> «проводника», «ютуб» -> «ютуба»; Latin / multi-word names -> «Chrome»."""
+    if not re.fullmatch(r"[а-яё]+", label):
+        return f"«{label}»"
+    if label.endswith(("й", "ь")):
+        return label[:-1] + "я"
+    if label.endswith("а"):
+        return label[:-1] + "ы"
+    if label.endswith(("о", "е", "и", "ы", "у", "ю", "я")):
+        return label
+    return label + "а"
+
+
+GUARD_MSG = {"game": "Игры не закрываю.", "blocked": "Это окно у тебя в списке «Не закрывать»."}
 
 
 def _target_words(rest: str) -> str:
@@ -53,9 +79,13 @@ class WindowsSkill(Skill):
     name = "windows"
 
     def __init__(self, ctx, manager: Optional[wn.WindowManager] = None, start: bool = True,
-                 tabs=None, select_tab=None):
+                 tabs=None, select_tab=None, quitter: Optional[procs.Quitter] = None,
+                 steam_game_running=procs.steam_game_running):
         super().__init__(ctx)
         self.wm = manager or wn.WindowManager(wn.default_backend())
+        self.quitter = quitter if quitter is not None else (procs.Quitter(own_pids=set(self.wm.own) or None)
+                                                            if self.wm.b is not None else None)
+        self.steam_game_running = steam_game_running
         from .. import uia
         self.tabs = tabs or uia.browser_tabs
         self.select_tab = select_tab or uia.select_tab
@@ -86,37 +116,227 @@ class WindowsSkill(Skill):
                     if e and score >= 0.6 and exe.endswith(".exe"):
                         base = re.split(r"[\\/]", exe)[-1]
                         wins = [w for w in self.wm.candidates() if w.exe == base]
+                    elif e and score >= 0.6 and getattr(e, "is_game", False):
+                        gname = games._norm(e.name)              # «киберпанк» -> window «Cyberpunk 2077»
+                        first = gname.split()[0] if gname else ""
+                        wins = [w for w in self.wm.candidates()
+                                if (t := games._norm(w.title)) and (t == gname or t.startswith(gname + " ")
+                                                                    or (len(first) >= 5 and t.split()[0] == first))]
+                        if wins:
+                            return wins, e.name, None
                 except Exception as ex:
                     log.debug("launcher find: %s", ex)
         return wins, name, None
 
     # ------------------------------------------------------------ actions
+    # ------------------------------------------------------------ 1.0.9 game guard
+    def _noname(self) -> bool:
+        return bool(self.ctx.extra.get("noname"))
+
+    def _say(self, text: str) -> ToolResult:
+        """Refusals are silent for no-name commands (the user may not have been talking to Jarvis at all)."""
+        return ToolResult("" if self._noname() else text)
+
+    def _guard(self, w: wn.Window) -> str:
+        """'' | 'blocked' (user's «Не закрывать» list) | 'game'."""
+        never = ((self.ctx.cfg.get("windows") or {}).get("never_close") or []) if self.ctx.cfg else []
+        if games.blocked(w, never):
+            return "blocked"
+        why = games.why_game(w, self.wm.b, self.ctx.extra.get("launcher"), games.game_mode_on(self.ctx))
+        if why:
+            log.info("Не закрываю игру %r (%s): %s", w.title, w.exe, why)
+            return "game"
+        return ""
+
+    def close_game(self) -> ToolResult:
+        """«Джарвис, закрой игру»: only with the name, only after «да»; never taskkill."""
+        if self._noname():
+            return ToolResult("")
+        if self.wm.b is None:
+            return ToolResult("Управлять окнами я умею только в Windows.")
+        front = self.wm.close_target()
+        cands = ([front] if front is not None else []) + [w for w in self.wm.candidates()
+                                                          if front is None or w.hwnd != front.hwnd]
+        never = (self.ctx.cfg.get("windows") or {}).get("never_close") or [] if self.ctx.cfg else []
+        gm = games.game_mode_on(self.ctx)
+        launcher = self.ctx.extra.get("launcher")
+        game = next((w for w in cands if games.why_game(w, self.wm.b, launcher, gm)), None)
+        if game is None:
+            return ToolResult("Не вижу открытой игры.")
+        if games.blocked(game, never):
+            return ToolResult(GUARD_MSG["blocked"])
+        return self._confirm_game(game, self._label(game))
+
     def close(self, name: str, tab: bool = False) -> ToolResult:
         if self.wm.b is None:
             return ToolResult("Управлять окнами я умею только в Windows.")
         name = name.strip()
+        if GAME_RE.match(name):
+            return self.close_game()
         if SELF_RE.match(name):
             return ToolResult("Себя я так не закрываю. Если хочешь меня выключить — скажи «выход».")
         if ALL_RE.match(name):
             return ToolResult("Все окна разом не закрываю — скажи, какое именно. Могу свернуть все.")
-        if tab or not name:
+        if tab:
             w = self.wm.active()
+            if w is None or not w.is_browser:
+                return self._say("Сейчас активно не окно браузера — какую вкладку закрыть?")
+            ok = self.wm.b.ctrl_w(w.hwnd) and self.wm._gone(w.hwnd, w.title, tab=True)
+            return ToolResult("Закрыл вкладку." if ok else "Не получилось закрыть вкладку.")
+        if not name:                                     # bare «закрой» = the WHOLE window in front at speech start
+            w = self.wm.close_target()
             if w is None:
-                return ToolResult("Не понял, какое окно закрыть: назови его, например «закрой ютуб».")
-            if tab:
-                if not w.is_browser:
-                    return ToolResult("Сейчас активно не окно браузера — какую вкладку закрыть?")
-                ok = self.wm.b.ctrl_w(w.hwnd) and self.wm._gone(w.hwnd, w.title, tab=True)
-                return ToolResult("Закрыл вкладку." if ok else "Не получилось закрыть вкладку.")
-            return self._close_one(w, self._label(w))
+                return self._say("Не вижу, какое окно закрыть: назови его, например «закрой хром».")
+            g = self._guard(w)
+            if g:
+                return self._say(GUARD_MSG[g])
+            return self._close_one(w, self._label(w), whole=True)
         wins, label, tgt = self._windows_for(name)
+        if procs.app_key(name) is not None or not wins:   # tray apps (Steam, Discord, WiFi Mouse…): quit fully
+            q = self.quit_app(name, label if tgt is not None else name, wins)
+            if q is not None:
+                return q
         if not wins:
             if tgt is not None and tgt.key == "ютуб музыка":
                 ok = pu.press_media_key("stop")
                 return ToolResult("Окна ютуб музыки не вижу — остановил воспроизведение." if ok
                                   else "Не вижу открытого окна ютуб музыки.")
             return ToolResult(f"Не вижу открытого окна «{label}».")
-        return self._close_one(wins[0], label, more=len(wins) - 1)
+        guards = [self._guard(w) for w in wins]
+        keep = [w for w, g in zip(wins, guards) if not g]
+        if not keep:
+            if guards[0] == "game":                      # the user NAMED the game: explicit, but only with «да»
+                return self._confirm_game(wins[0], label)
+            return self._say(GUARD_MSG[guards[0]])
+        return self._close_one(keep[0], label, more=len(keep) - 1)
+
+    def close_all(self, name: str) -> ToolResult:
+        """«закрой весь проводник / все окна хрома / весь ютуб»: every window (or YouTube tab) of that app, gracefully
+        (WM_CLOSE, never a kill). «закрой все окна» = all windows of the app in front. Games are never included."""
+        if self.wm.b is None:
+            return ToolResult("Управлять окнами я умею только в Windows.")
+        name = name.strip()
+        if GAME_RE.match(name) or SELF_RE.match(name):
+            return self.close(name)
+        if not name:                                     # all windows of the active app
+            front = self.wm.close_target()
+            if front is None:
+                return self._say("Все окна разом не закрываю — скажи, какие: например «закрой весь проводник».")
+            if self._guard(front):
+                return self._say(GUARD_MSG[self._guard(front)])
+            cls = front.cls if front.exe == "explorer.exe" else None
+            wins = [w for w in self.wm.candidates() if w.exe == front.exe and (cls is None or w.cls == cls)]
+            label, tgt = self._label(front) if front.exe != "explorer.exe" else "проводник", None
+        else:
+            wins, label, tgt = self._windows_for(name)
+        if tgt is not None and tgt.key == "ютуб":
+            return self._close_all_youtube(tgt, wins)
+        if not wins:
+            if procs.app_key(name) is not None:
+                q = self.quit_app(name, label, wins)
+                if q is not None:
+                    return q
+            return ToolResult(f"Не вижу открытых окон «{label}».")
+        guards = [self._guard(w) for w in wins]
+        keep = [w for w, g in zip(wins, guards) if not g]
+        if not keep:
+            if guards[0] == "game" and name:
+                return self._confirm_game(wins[0], label)
+            return self._say(GUARD_MSG[guards[0]])
+        if len(keep) == 1:
+            return self._close_one(keep[0], label, whole=True, kill=False)
+        closed, dialogs, failed = 0, 0, 0
+        for w in keep:
+            res = self.wm.close(w, whole=True, kill=False)
+            log.info("close all %r (%s): %s", w.title, w.exe, res)
+            closed += res == "closed"
+            dialogs += res == "dialog"
+            failed += res not in ("closed", "dialog")
+        return ToolResult(self._all_reply(closed, dialogs, failed, f"{plural(closed, 'окно', 'окна', 'окон')} "
+                                                                    f"{genitive(label)}"))
+
+    def _all_reply(self, closed: int, dialogs: int, failed: int, what: str) -> str:
+        parts = [f"Закрыл {closed} {what}." if closed else "Ничего не закрылось."]
+        if dialogs:
+            parts.append(f"{dialogs} {plural(dialogs, 'просит', 'просят', 'просят')} сохранить изменения — ответь в окне.")
+        if failed:
+            parts.append(f"{failed} не {plural(failed, 'закрылось', 'закрылись', 'закрылись')}.")
+        text = " ".join(parts)
+        return "" if self._noname() and not closed else text
+
+    def _close_all_youtube(self, tgt: wn.Target, wins: list) -> ToolResult:
+        """YouTube app windows (PWA) are closed whole; in browsers every YouTube TAB gets Ctrl+W (UIA tab list);
+        without UIA only the active YouTube tabs are closed."""
+        rx = re.compile(tgt.title_re, re.I) if tgt.title_re else None
+        ex = re.compile(tgt.exclude_re, re.I) if tgt.exclude_re else None
+        closed = 0
+        for w in [w for w in wins if not w.is_browser]:
+            closed += self.wm.close(w, whole=True, kill=False) == "closed"
+        for w in [w for w in self.wm.candidates() if w.is_browser]:
+            for _ in range(40):                          # re-read the tab list after every close (stale elements)
+                tabs = [t for t in (self.tabs(w.hwnd) or [])
+                        if rx and rx.search(t["name"]) and not (ex and ex.search(t["name"]))]
+                if not tabs:
+                    break
+                if not (self.select_tab(tabs[0]["el"]) and self.wm.b is not None and self.wm.b.ctrl_w(w.hwnd)):
+                    break
+                self.wm.sleep(0.15)
+                closed += 1
+            else:
+                continue
+        if closed == 0:                                  # no UIA tab list: the active YouTube tab of each window
+            for w in [w for w in wins if w.is_browser]:
+                closed += self.wm.close(w, whole=False, kill=False) in ("tab_closed", "closed")
+        if closed == 0:
+            return self._say("Не вижу открытого ютуба.")
+        return ToolResult(f"Закрыл ютуб: {closed} {plural(closed, 'вкладку', 'вкладки', 'вкладок')}." if closed > 1
+                          else "Закрыл вкладку с ютубом.")
+
+    def _confirm_game(self, w: wn.Window, label: str) -> ToolResult:
+        if self._noname():
+            return ToolResult(f"Игру закрою только по имени: «Джарвис, закрой {label}».", noname_say=True)
+        nice = label if any(c.isupper() for c in label) else self._label(w)
+        return ToolResult("", confirm=Confirm(
+            f"Точно закрыть {nice}? Несохранённый прогресс пропадёт. Да или нет?",
+            lambda: self._close_one(w, nice, whole=True, kill=False), "Окей, не закрываю."))
+
+    # ------------------------------------------------------------ 1.0.9 quit apps (also tray-only ones)
+    def quit_app(self, name: str, label: str, wins: list) -> Optional[ToolResult]:
+        """-> None when no process of that app runs (caller falls back to window logic / «не вижу»)."""
+        if self.quitter is None:
+            return None
+        found = self.quitter.find(name)
+        found = [p for p in found if not games.why_game(wn.Window(0, "", p.pid, p.name), path=p.exe or "")]
+        if not found:
+            return None
+        gw = next((w for w in wins if self._guard(w) == "game"), None)
+        if gw is not None:                               # a game window under that name -> game rule
+            return self._confirm_game(gw, label)
+        key = procs.app_key(name)
+        nice = {"вайфай маус": "WiFi Mouse", "батлнет": "Battle.net", "гог": "GOG Galaxy", "иа": "EA app",
+                "юбисофт": "Ubisoft Connect", "райот": "Riot Client"}.get(key or "", label)
+
+        def go() -> ToolResult:
+            status, rest = self.quitter.quit(found)   # type: ignore[union-attr]
+            log.info("quit %s: %s %s", nice, status, [p.name for p in rest])
+            if status == "quit":
+                return ToolResult(f"Закрыл {nice}.")
+            if status == "none":
+                return ToolResult(f"{nice} уже не запущен.")
+            if self._noname():
+                return ToolResult("")
+            return ToolResult("", confirm=Confirm(
+                f"{nice} не закрывается. Убить процесс? Несохранённое пропадёт. Да или нет?",
+                lambda: ToolResult(f"Закрыл {nice}." if self.quitter.force(rest)   # type: ignore[union-attr]
+                                   else f"Не получилось закрыть {nice}: процесс не завершается."),
+                "Окей, оставил."))
+        if any(p.name == "steam.exe" for p in found) and self.steam_game_running():
+            if self._noname():
+                return ToolResult("")
+            return ToolResult("", confirm=Confirm(
+                "Сейчас запущена игра из Steam — она закроется вместе с ним. Закрыть Steam? Да или нет?",
+                go, "Окей, Steam не трогаю."))
+        return go()
 
     @staticmethod
     def _label(w: wn.Window) -> str:
@@ -124,19 +344,22 @@ class WindowsSkill(Skill):
         t = t.rsplit(" - ", 1)[-1] if " - " in t else t
         return t[:40] or "окно"
 
-    def _close_one(self, w: wn.Window, label: str, more: int = 0) -> ToolResult:
-        res = self.wm.close(w)
+    def _close_one(self, w: wn.Window, label: str, more: int = 0, whole: bool = False,
+                   kill: bool = True) -> ToolResult:
+        res = self.wm.close(w, whole=whole, kill=kill)
         log.info("close %r (%s pid %s): %s", w.title, w.exe, w.pid, res)
         tail = f" Открыто ещё {more} — повтори, если закрыть и их." if more > 0 else ""
         if res == "closed":
             return ToolResult(f"Закрыл {label}.{tail}")
         if res == "tab_closed":
             return ToolResult(f"Закрыл вкладку с {label}ом." if label == "ютуб" else "Закрыл вкладку.")
-        if res == "dialog":
-            return ToolResult(f"{label[:1].upper() + label[1:]} спрашивает, сохранить ли изменения — ответь в окне.")
+        if res == "dialog":                              # never force-killed: the user decides in the window
+            return self._say(f"{label[:1].upper() + label[1:]} просит сохранить изменения — ответь в окне.")
         if res == "protected":
-            return ToolResult("Это системное окно, его я не трогаю.")
-        return ToolResult(f"Не получилось закрыть {label}: окно не закрывается.")
+            return self._say("Это системное окно, его я не трогаю.")
+        if not kill:
+            return ToolResult(f"{label[:1].upper() + label[1:]} не закрывается — выйди через меню игры.")
+        return self._say(f"Не получилось закрыть {label}: окно не закрывается.")
 
     def show(self, name: str, cmd: str) -> ToolResult:
         if self.wm.b is None:
@@ -199,6 +422,7 @@ class WindowsSkill(Skill):
     # ------------------------------------------------------------ voice
     def match(self, text: str, t: str) -> Optional[ToolResult]:
         t = t.replace("закрой-ка", "закрой ка")
+        t = SPLIT_RE.sub(r"\1 \2\3", t)                  # Whisper: «закройки берпанк» -> «закрой киберпанк»
         if BACK_TO_PREV.match(t):
             return self.back_to_previous()
         m = VERB_RE.match(t)
@@ -231,8 +455,8 @@ class WindowsSkill(Skill):
             return self.show(target, "minimize")
         if is_max:
             return self.show(target, "maximize")
-        if re.match(r"^(все|всё)( окна)?$", rest):
-            return self.close("все")
+        if ALL_MOD.search(rest):                       # 1.0.9: «закрой весь проводник», «закрой все окна хрома»
+            return self.close_all(" ".join(w for w in target.split() if w not in ALL_NOISE and not ALL_MOD.fullmatch(w)))
         return self.close(target, tab=tab)
 
     def tools(self):

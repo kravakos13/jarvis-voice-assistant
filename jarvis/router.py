@@ -29,6 +29,7 @@ SKILLS = [
     ("weather", "weather_skill", "WeatherSkill"),
     ("system", "system_skill", "SystemSkill"),
     ("explorer", "explorer_skill", "ExplorerSkill"),     # before smarthome/media: «открой второе» by context
+    ("view", "view_skill", "ViewSkill"),                  # 1.0.9 «полный экран», «кинотеатр», «субтитры» (YouTube)
     ("nav", "nav_skill", "NavSkill"),                    # «назад/вперёд [N раз]», «перемотай назад на 30 секунд»
     ("keys", "keys_skill", "KeysSkill"),                 # «нажми энтер / контрол цэ / вниз три раза»
     ("hotkeys", "hotkeys_skill", "HotkeysSkill"),        # data-driven: jarvis/commands.yaml (+ user file)
@@ -180,8 +181,10 @@ class Router:
             # anything else: treat as a new command
         if self.pending_expect:
             cb, self.pending_expect = self.pending_expect, None
-            self.last_skill = "expect"
-            return self._finalize(self._safe(lambda: cb(text)))
+            r: Optional[ToolResult] = cb(text) if getattr(cb, "optional", False) else self._safe(lambda: cb(text))
+            if r is not None:                        # optional expects (file pick) return None = a new command
+                self.last_skill = "expect"
+                return self._finalize(r)
         # modal skills (dictation, translator) get every phrase first
         for skill in self.skills:
             if getattr(skill, "awaiting", False) and hasattr(skill, "handle_modal"):

@@ -27,7 +27,7 @@ class WebSkill(Skill):
         return ToolResult("", then=work)   # «Секунду» comes from the assistant only if it takes > ack_after_s
 
     def match(self, text: str, t: str) -> Optional[ToolResult]:
-        if re.match(r"^(загугли|погугли)\b|в гугле|в яндексе|на ютуб", t):
+        if re.search(r"^(загугли|погугли|гугли)\b|\bв (гугле|яндексе|хроме|chrome|браузере)\b|\bна ютуб", t):
             return None
         m = ASK_RE.match(t)
         if m and not re.search(r"\b(видео|ютуб\w*|youtube|заметк\w*|задач\w*|файл\w*)\b", t):

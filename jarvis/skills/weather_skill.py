@@ -28,6 +28,10 @@ def deg(n: float) -> str:
     return f"{v} {plural_ru(v, 'градус', 'градуса', 'градусов')}"
 
 
+# 1.0.9: «загугли погода в москве», «найди в хроме погоду» -> an explicit browser search (core), not the forecast
+BROWSER_SEARCH_RE = re.compile(r"^(?:загугли|погугли|гугли)\b|\b(?:в|на|через) (?:гугле?|яндексе?|хроме|chrome|google|"
+                               r"браузере|ютубе?)\b")
+
 class WeatherSkill(Skill):
     name = "weather"
 
@@ -80,7 +84,7 @@ class WeatherSkill(Skill):
                 f"Днём {rng}{rain_s}.")
 
     def match(self, text: str, t: str) -> Optional[ToolResult]:
-        if not WEATHER_RE.search(t):
+        if not WEATHER_RE.search(t) or BROWSER_SEARCH_RE.search(t):
             return None
         m = CITY_RE.search(t)
         city = m.group(1) if m and m.group(1) not in ("сегодня", "завтра", "городе") else None
