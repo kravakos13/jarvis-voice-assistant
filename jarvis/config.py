@@ -31,7 +31,7 @@ DEFAULTS: dict[str, Any] = {
                   "greet_on_start": True, "follow_up_seconds": 0, "extra_wake_words": [],
                   "request_timeout_s": 6, "request_silence_ms": 1200, "max_request_s": 15, "tts_tail_ms": 500,
                   "ack_after_s": 2.5},
-    "stt": {"model": "small", "device": "auto", "compute_type": "auto", "language": "ru", "beam_size": 1,
+    "stt": {"model": "small", "device": "cpu", "compute_type": "auto", "language": "ru", "beam_size": 1,
             "download_root": "models/whisper", "initial_prompt": "Джарвис, привет."},
     "audio": {"input_device": None, "output_device": None, "sample_rate": 16000, "vad": "webrtc",
               "vad_aggressiveness": 2, "energy_threshold": 0.015, "frame_ms": 30, "silence_ms": 800,
@@ -75,7 +75,7 @@ def _read_yaml(path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
-CONFIG_VERSION = 5
+CONFIG_VERSION = 6
 REMOVED_SECTIONS = ("whatsapp", "comfyui", "faceswap", "video")
 
 
@@ -122,6 +122,15 @@ def migrate_local(data) -> tuple[dict, bool]:
         if isinstance(llm5, dict) and str(llm5.get("num_ctx", "")).strip() == "8192":
             llm5.pop("num_ctx")                   # 1.0.4 default pinned by Settings -> 6144 (a user's own value is kept)
         data["config_version"] = 5
+        changed = True
+    if ver < 6:                                   # 1.0.6: GPU Whisper without CUDA libs broke voice mode
+        stt = data.get("stt")
+        if isinstance(stt, dict):
+            if str(stt.get("device", "")).strip().lower() in ("cuda", "auto"):
+                stt.pop("device")                 # -> new default "cpu" (GPU is opt-in, falls back safely)
+            if str(stt.get("compute_type", "")).strip().lower() in ("float16", "int8_float16"):
+                stt.pop("compute_type")           # GPU-only types fail on the CPU fallback -> auto
+        data["config_version"] = 6
         changed = True
     return data, changed
 

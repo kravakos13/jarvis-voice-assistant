@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
-import os
-import sys
+from typing import Any, Callable, Optional
 import threading
 import time
 from pathlib import Path
@@ -18,79 +16,123 @@ log = logging.getLogger(__name__)
 
 def _add_windows_cuda_dlls() -> None:
     """On Windows, make DLLs from pip packages nvidia-cublas-cu12 / nvidia-cudnn-cu12 visible."""
-    if sys.platform != "win32":
-        return
-    for base in map(Path, sys.path):
-        nv = base / "nvidia"
-        if not nv.is_dir():
-            continue
-        for bin_dir in nv.glob("*/bin"):
-            try:
-                os.add_dll_directory(str(bin_dir))
-                os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
-            except Exception:
-                pass
+    from . import cuda_libs
+    cuda_libs.add_dll_dirs()
+
+
+GPU_ONLY_COMPUTE = ("float16", "int8_float16", "bfloat16", "int8_bfloat16")
 
 
 def pick_device(device: str = "auto", compute_type: str = "auto") -> tuple[str, str]:
     device = (device or "auto").lower()
     if device == "auto":
         try:
+            _add_windows_cuda_dlls()          # before the first ctranslate2 import
             import ctranslate2
             device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
         except Exception:
             device = "cpu"
     if not compute_type or compute_type == "auto":
-        # int8_float16: ~2x less VRAM than float16 and faster on GTX 16xx (no tensor cores), same accuracy
-        compute_type = "int8_float16" if device == "cuda" else "int8"
+        compute_type = "float16" if device == "cuda" else "int8"      # as in 1.0.4
+    if device != "cuda" and compute_type in GPU_ONLY_COMPUTE:
+        compute_type = "int8"            # CTranslate2 refuses float16/int8_float16 on the CPU
     return device, compute_type
-
 
 
 def _whisper(cls, model: str, **kw):
     """Load from the local cache first (fully offline, no Hugging Face requests); download only if missing."""
+    from .cuda_libs import is_gpu_lib_error
     try:
         return cls(model, local_files_only=True, **kw)
     except Exception as e:
-        if "cuda" in str(e).lower() or "cublas" in str(e).lower() or "cudnn" in str(e).lower():
+        if kw.get("device") == "cuda" and is_gpu_lib_error(e):
             raise
         log.info("Модель Whisper '%s' не найдена локально — скачиваю (один раз).", model)
         return cls(model, **kw)
 
+
+def probe(model, language: Optional[str] = "ru") -> None:
+    """Really run encoder + decoder once. faster-whisper's transcribe() returns a LAZY generator:
+    without iterating it, cuBLAS/cuDNN are never loaded and a missing DLL only shows up on the first
+    real phrase (1.0.5 bug: "cublas64_12.dll is not found" -> voice loop died -> text mode)."""
+    noise = (np.random.default_rng(0).standard_normal(16000) * 1e-3).astype(np.float32)
+    segments, _ = model.transcribe(noise, language=language, beam_size=1, without_timestamps=True,
+                                   condition_on_previous_text=False, vad_filter=False)
+    for _ in segments:
+        pass
+
+
+GPU_FAIL_NOTICE = "Видеокарта для распознавания не запустилась ({why}) — распознаю на процессоре."
+
+
+def _why(e: BaseException) -> str:
+    from .cuda_libs import short_error
+    s = short_error(e).lower()
+    return "нет библиотек CUDA" if ("cublas" in s or "cudnn" in s or ".dll" in s) else "ошибка CUDA"
+
+
 class SpeechToText:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, on_notice: Optional[Callable[[str], None]] = None):
         self.cfg = cfg
         self._lock = threading.RLock()
         self.relocated = False
         self._orig: Optional[tuple[str, str]] = None
+        self.on_notice = on_notice
+        self.gpu_error: Optional[str] = None      # why the GPU was given up (diagnostics shows it)
         self.language = cfg.get("language", "ru")
         self.beam_size = int(cfg.get("beam_size", 1))
         self.initial_prompt = cfg.get("initial_prompt") or None
         _add_windows_cuda_dlls()
-        from faster_whisper import WhisperModel
-
-        device, compute = pick_device(cfg.get("device", "auto"), cfg.get("compute_type", "auto"))
-        model = cfg.get("model", "small")
-        root = cfg.get("download_root")
-        root = str(resolve_path(root)) if root else None
-        t0 = time.time()
+        self.requested = (cfg.get("device") or "auto").lower()
+        device, compute = pick_device(self.requested, cfg.get("compute_type", "auto"))
         try:
-            self.model = _whisper(WhisperModel, model, device=device, compute_type=compute, download_root=root,
-                                  cpu_threads=int(cfg.get("cpu_threads", 0) or 0))
-            if device == "cuda":  # catch missing cuBLAS/cuDNN early
-                self.model.transcribe(np.zeros(16000, np.float32), language=self.language)
-        except Exception as e:
-            if device != "cuda":
-                raise
-            log.warning("CUDA недоступна для Whisper (%s). Переключаюсь на CPU/int8.", e)
-            device, compute = "cpu", "int8"
-            self.model = _whisper(WhisperModel, model, device=device, compute_type=compute, download_root=root,
-                                  cpu_threads=int(cfg.get("cpu_threads", 0) or 0))
+            import ctranslate2
+            import faster_whisper
+            vers = f"faster-whisper {faster_whisper.__version__}, ctranslate2 {ctranslate2.__version__}"
+        except Exception:
+            vers = "?"
+        log.info("Whisper: в настройках device=%s compute_type=%s -> пробую %s/%s (%s)",
+                 cfg.get("device"), cfg.get("compute_type"), device, compute, vers)
+        model = cfg.get("model", "small")
+        t0 = time.time()
+        self.model: Any = None
+        if device == "cuda":
+            try:
+                self.model = self._load(device, compute)
+                probe(self.model, self.language)
+            except Exception as e:                # missing cuBLAS/cuDNN, old driver, out of VRAM...
+                self.model = None
+                self._gpu_failed(e)
+                device, compute = "cpu", "int8"
+        if self.model is None:
+            self.model = self._load(device, compute)
         self.device, self.compute_type = device, compute
         log.info("Whisper '%s' загружен (%s/%s) за %.1f с", model, device, compute, time.time() - t0)
 
+    def _gpu_failed(self, e: BaseException) -> None:
+        from .cuda_libs import short_error
+        import gc
+        gc.collect()
+        self.gpu_error = short_error(e)
+        log.warning("Whisper: видеокарта недоступна (%s: %s) — переключаюсь на CPU/int8.", type(e).__name__, self.gpu_error)
+        if self.requested == "cuda" and self.on_notice:      # the user asked for the GPU explicitly -> tell them
+            try:
+                self.on_notice(GPU_FAIL_NOTICE.format(why=_why(e)))
+            except Exception:
+                pass
+
+    def _fallback_cpu(self, e: BaseException) -> None:
+        """GPU failed while running (first real phrase): reload on CPU/int8 for the rest of the session."""
+        self.model = None
+        self._gpu_failed(e)
+        self.model = self._load("cpu", "int8")
+        self.device, self.compute_type = "cpu", "int8"
+        self._orig = None                         # never "restore" to the broken GPU after game mode
+
     def _load(self, device: str, compute: str):
         from faster_whisper import WhisperModel
+        if device != "cuda" and compute in GPU_ONLY_COMPUTE:
+            compute = "int8"
         root = self.cfg.get("download_root")
         root = str(resolve_path(root)) if root else None
         return _whisper(WhisperModel, self.cfg.get("model", "small"), device=device, compute_type=compute, download_root=root,
@@ -101,7 +143,7 @@ class SpeechToText:
         with self._lock:
             try:
                 if target == "restore":
-                    if self._orig:
+                    if self._orig and not (self.gpu_error and self._orig[0] == "cuda"):
                         dev, comp = self._orig
                         self.model = None
                         self.model = self._load(dev, comp)
@@ -125,7 +167,15 @@ class SpeechToText:
         with self._lock:
             if self.model is None:          # unloaded in game mode -> reload on demand (CPU)
                 self.model = self._load("cpu", "int8")
-            return self._transcribe(audio, language)
+                self.device, self.compute_type = "cpu", "int8"
+            try:
+                return self._transcribe(audio, language)
+            except Exception as e:
+                from .cuda_libs import is_gpu_lib_error
+                if self.device != "cuda" and not is_gpu_lib_error(e):
+                    raise
+                self._fallback_cpu(e)           # e.g. cublas64_12.dll missing: retry this phrase on the CPU
+                return self._transcribe(audio, language)
 
     def _transcribe(self, audio, language: str | None = "default") -> str:
         """audio: float32 numpy array at 16 kHz, or a path to an audio file."""

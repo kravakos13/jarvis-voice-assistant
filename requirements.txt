@@ -1,6 +1,7 @@
 # Jarvis — offline voice assistant (Python 3.10-3.12, Windows 10/11)
 # core
-faster-whisper>=1.0.3
+faster-whisper==1.2.1
+ctranslate2==4.8.3          # CUDA 12.4 build; GPU (opt-in) needs cuBLAS 12 + cuDNN 9.10 (see README)
 sounddevice>=0.4.6
 numpy>=1.24
 requests>=2.31

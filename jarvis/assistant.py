@@ -66,6 +66,7 @@ def greeting_text(a: dict, now: Optional[_dt.datetime] = None) -> str:
 
 
 class Assistant:
+    stt: Any = None                      # set after set_profile() in __init__
     _saved_keep_alive: Any = None        # game mode (GPU placement): keep_alive before unloading
     _llm_moved: bool = False             # game mode (auto placement): model moved to RAM
     def __init__(self, cfg: dict, speak: bool = True, need_stt: bool = True,
@@ -118,9 +119,8 @@ class Assistant:
 
         self.stt = None
         if need_stt:
-            from .stt import SpeechToText
             self.emit("notice", text="Загружаю распознавание речи...")
-            self.stt = SpeechToText(cfg["stt"])
+            self.stt = self._load_stt(cfg["stt"])
 
         self.timings = Timings()
         self._trace: Optional[Trace] = None
@@ -407,10 +407,28 @@ class Assistant:
             self._idle.clear()
             self._commands.put((text.strip(), source, trace))
 
+    def _load_stt(self, scfg: dict):
+        """Whisper as configured; if that fails for any reason, CPU/int8: never lose voice mode to the STT device."""
+        from .stt import SpeechToText
+
+        def notice(t: str) -> None:
+            self.emit("notice", text=t)
+        try:
+            return SpeechToText(scfg, on_notice=notice)
+        except Exception as e:
+            if str(scfg.get("device", "")).lower() == "cpu" and scfg.get("compute_type") in (None, "auto", "int8"):
+                raise                               # already the safest setting: a real problem (model files...)
+            log.warning("Whisper (%s) не загрузился: %s — пробую процессор/int8.", scfg.get("device"), e)
+            return SpeechToText(dict(scfg, device="cpu", compute_type="int8"), on_notice=notice)
+
     def _transcribe(self, audio, language=None) -> str:
         """Whisper with timing (the trace of the command starts when the user stopped speaking)."""
         t0 = time.monotonic()
-        text = self.stt.transcribe(audio, language=language) if self.stt is not None else ""
+        try:
+            text = self.stt.transcribe(audio, language=language) if self.stt is not None else ""
+        except Exception as e:                  # never let one failed phrase kill the voice loop
+            log.exception("Распознавание не удалось: %s", e)
+            text = ""
         self._stt_last = (t0, time.monotonic() - t0)
         return text
 
@@ -748,7 +766,11 @@ class Assistant:
                     continue
 
                 flow.cfg = self.cfg["assistant"]          # live: Settings changes apply at once
-                flow.step()
+                try:
+                    flow.step()
+                except Exception as e:                    # keep listening: one bad step must not drop to text mode
+                    log.exception("Голосовой цикл: %s", e)
+                    self.stop_event.wait(0.5)
 
     def run_wav(self, path: str) -> None:
         from .audio import read_wav

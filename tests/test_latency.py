@@ -224,9 +224,9 @@ def test_ollama_tray_app_also_gets_the_env(monkeypatch):
     assert seen and seen[0]["OLLAMA_FLASH_ATTENTION"] == "1"
 
 
-def test_whisper_auto_compute_is_int8_float16_on_gpu():
+def test_whisper_auto_compute_is_float16_on_gpu_like_1_0_4():
     from jarvis.stt import pick_device
-    assert pick_device("cuda", "auto") == ("cuda", "int8_float16")
+    assert pick_device("cuda", "auto") == ("cuda", "float16")
     assert pick_device("cpu", "auto") == ("cpu", "int8")
     assert pick_device("cuda", "float32") == ("cuda", "float32")
 
@@ -236,7 +236,7 @@ def test_defaults_and_migration_v5():
     assert C.DEFAULTS["llm"]["num_ctx"] == 6144 and C.DEFAULTS["llm"]["placement"] == "gpu"
     assert C.DEFAULTS["assistant"]["ack_after_s"] == 2.5
     d, ch = C.migrate_local({"config_version": 4, "llm": {"num_ctx": 8192, "model": "qwen2.5:7b"}})
-    assert ch and d["llm"] == {"model": "qwen2.5:7b"} and d["config_version"] == C.CONFIG_VERSION == 5
+    assert ch and d["llm"] == {"model": "qwen2.5:7b"} and d["config_version"] == C.CONFIG_VERSION >= 5
     d, _ = C.migrate_local({"config_version": 4, "llm": {"num_ctx": 12000}})
     assert d["llm"]["num_ctx"] == 12000
 

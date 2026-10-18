@@ -2,7 +2,7 @@
 ; Стадия сборки: build\stage\ = исходники + python\ (embeddable Python 3.11.9 с включённым site)
 #define AppName "Джарвис"
 #ifndef AppVersion
-  #define AppVersion "1.0.5"
+  #define AppVersion "1.0.6"
 #endif
 #define Stage "..\build\stage"
 

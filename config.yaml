@@ -4,7 +4,7 @@
 #  (он накладывается поверх этого файла).
 # =====================================================================
 
-config_version: 5            # версия схемы настроек (миграции выполняются автоматически)
+config_version: 6            # версия схемы настроек (миграции выполняются автоматически)
 
 assistant:
   name: "Джарвис"            # имя = слово-активатор. Поменяй тут — варианты/падежи сгенерируются сами
@@ -26,8 +26,8 @@ assistant:
 
 stt:                         # распознавание речи faster-whisper
   model: "small"             # tiny / base / small / medium / large-v3 (больше = точнее, но медленнее)
-  device: "auto"             # auto (cuda если есть) / cuda / cpu
-  compute_type: "auto"       # auto: cuda->int8_float16 (быстро, ~0,3 ГБ VRAM), cpu->int8. Если глючит: float32
+  device: "cpu"              # cpu (надёжно, по умолчанию) / cuda (видеокарта, экспериментально: нужны cuBLAS 12 + cuDNN 9; если не запустится — сам перейдёт на cpu) / auto
+  compute_type: "auto"       # auto: cpu->int8, cuda->float16
   language: "ru"
   beam_size: 1
   download_root: "models/whisper"

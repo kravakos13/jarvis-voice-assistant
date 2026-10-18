@@ -57,7 +57,11 @@ def _mic(cfg, quick) -> Check:
 def _whisper(cfg, assistant, quick) -> Check:
     stt = getattr(assistant, "stt", None) if assistant else None
     if stt is not None and getattr(stt, "model", None) is not None:
-        return Check("whisper", "Распознавание (Whisper)", True, f"Модель {cfg['stt'].get('model')} на {getattr(stt, 'device', '?')}")
+        where = "видеокарте" if getattr(stt, "device", "") == "cuda" else "процессоре"
+        detail = f"Модель {cfg['stt'].get('model')} на {where}"
+        if getattr(stt, "gpu_error", None):
+            return _whisper_gpu_hint(detail)
+        return Check("whisper", "Распознавание (Whisper)", True, detail)
     try:
         import faster_whisper  # noqa: F401
     except Exception as e:
@@ -74,6 +78,19 @@ def _whisper(cfg, assistant, quick) -> Check:
         _raw("whisper load", e)
         return Check("whisper", "Распознавание (Whisper)", False,
                      "Модель не загрузилась (подробности в журнале). Без интернета первая загрузка невозможна.")
+
+
+def _whisper_gpu_hint(detail: str) -> Check:
+    """Whisper fell back from the GPU to the CPU: say why and offer the NVIDIA libraries (big download)."""
+    from . import cuda_libs
+    missing = cuda_libs.missing_dlls()
+    if missing and cuda_libs.nvidia_gpu_present():
+        return Check("whisper", "Распознавание (Whisper)", None,
+                     f"{detail}: видеокарта не запустилась, нет библиотек CUDA ({', '.join(missing[:2])}...). "
+                     "Всё работает на процессоре. Чтобы не пробовать видеокарту при каждом запуске: "
+                     "Настройки → Микрофон → «Где работает распознавание» = Процессор.")
+    return Check("whisper", "Распознавание (Whisper)", None,
+                 f"{detail}: видеокарта для распознавания не запустилась (подробности в журнале).")
 
 
 def _ollama(cfg) -> list[Check]:

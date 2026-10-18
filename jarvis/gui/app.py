@@ -873,6 +873,25 @@ class Controller(QObject):
             faceimage.save_landmarks(dlg.result_landmarks())
             self.apply_ui()
 
+    def _voice_on_cpu(self) -> bool:
+        """A CUDA/cuBLAS/cuDNN error must never cost the voice mode: restart it with Whisper on the CPU."""
+        try:
+            from ..assistant import Assistant
+            from ..stt import SpeechToText
+            self.cfg["stt"].update(device="cpu", compute_type="int8")
+            self.emit_from_thread("notice", text="Видеокарта для распознавания не запустилась — распознаю на процессоре.")
+            if self.assistant is None:
+                self.assistant = Assistant(self.cfg, speak=self.speak, need_stt=True, on_event=self.emit_from_thread)
+                self.assistant.router.ctx.extra["open_settings"] = \
+                    lambda tab: self.emit_from_thread("open_settings", tab=tab)
+            else:                                   # reuse the running assistant, only swap Whisper
+                self.assistant.stt = SpeechToText(self.cfg["stt"])
+            self.assistant.run_voice()
+            return True
+        except Exception as e:
+            log.exception("Голосовой режим на процессоре тоже не запустился: %s", e)
+            return False
+
     def start_assistant(self) -> None:
         def worker():
             try:
@@ -884,6 +903,9 @@ class Controller(QObject):
                 self.assistant.run_voice()
             except Exception as e:
                 log.exception("Ассистент не запустился: %s", e)
+                from ..cuda_libs import is_gpu_lib_error
+                if is_gpu_lib_error(e) and self._voice_on_cpu():
+                    return
                 self.emit_from_thread("notice", text=f"Ошибка запуска: {e}. Работаю в текстовом режиме.")
                 try:
                     if self.assistant is None:
