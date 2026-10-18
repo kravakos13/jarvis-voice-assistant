@@ -297,6 +297,7 @@ class Controller(QObject):
         m.addSeparator()
         m.addAction("Открыть папку Jarvis", lambda: pu.open_path(pu.data_dir("")))
         m.addAction("Настройки...", self.open_settings)
+        m.addAction("Перезапустить прослушку", self.restart_listening)
         m.addAction("Синхронизировать", self.sync_now)
         m.addAction("Самодиагностика", self.run_diagnostics)
         m.addAction("Проверить обновления", lambda: self.check_updates(manual=True))
@@ -891,6 +892,19 @@ class Controller(QObject):
         except Exception as e:
             log.exception("Голосовой режим на процессоре тоже не запустился: %s", e)
             return False
+
+    def restart_listening(self) -> None:
+        """Tray: re-open the microphone and reset the voice state machine; revive the loop if it ended."""
+        a = self.assistant
+        if a is None or getattr(a, "stt", None) is None:
+            self.tray_message("Голосовой режим не запущен (работаю в текстовом режиме).")
+            return
+        if a.mic_muted:
+            a.set_mic_muted(False, cue=False)
+        if not a.restart_listening():
+            log.warning("Голосовой цикл не работал — запускаю заново")
+            threading.Thread(target=a.run_voice, name="jarvis-voice", daemon=True).start()
+        self.tray_message("Прослушка перезапущена. Скажи «Джарвис».")
 
     def start_assistant(self) -> None:
         def worker():

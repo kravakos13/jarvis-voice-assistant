@@ -217,6 +217,9 @@ class Microphone:
     """
 
     def __init__(self, device=None, rate: int = 16000, frame_ms: int = 30):
+        self._device_spec = device
+        self.wanted = False            # True while the stream should be running (False = closed on purpose)
+        self.reopened = 0
         self.device = resolve_device(device, "input")
         self.rate = rate
         self.frame_ms = frame_ms
@@ -236,6 +239,7 @@ class Microphone:
 
     def start(self):
         s = require_sd()
+        self.wanted = True
         try:
             self._dev_rate = self.rate
             self._stream = s.InputStream(device=self.device, channels=1, samplerate=self.rate,
@@ -248,6 +252,11 @@ class Microphone:
                                          dtype="float32", callback=self._callback)
         self._stream.start()
         return self
+
+    def pause(self):
+        """Privacy mute: really close the stream and don't re-open it."""
+        self.wanted = False
+        self.stop()
 
     def stop(self):
         if self._stream is not None:
@@ -267,11 +276,48 @@ class Microphone:
                 break
         self._buf = np.zeros(0, np.float32)
 
+    STALL_S = 4.0          # no audio callback for this long while the stream should run = it died
+
+    def reopen(self, reason: str = "") -> bool:
+        """Close and re-open the input stream (device unplugged/changed, driver glitch, sleep/resume)."""
+        log.warning("Микрофон: переоткрываю поток (%s)", reason or "по запросу")
+        self.stop()
+        self.wanted = True
+        try:
+            self.device = resolve_device(self._device_spec, "input") if sd is not None else self.device
+        except Exception:                                # noqa: BLE001
+            pass
+        try:
+            self.start()
+            self.reopened += 1
+            return True
+        except Exception as e:                           # noqa: BLE001 — retried on the next stall
+            log.error("Микрофон не открылся: %s", e)
+            self._stream = None
+            return False
+
     def frames(self, stop_event: Optional[threading.Event] = None) -> Iterator[np.ndarray]:
+        """Never blocks silently: if the stream stops delivering audio it is re-opened, and silence frames are
+        yielded meanwhile so listen() timeouts and abort checks keep working."""
+        last = time.monotonic()
+        silence = np.zeros(self.frame_len, np.float32)
         while not (stop_event and stop_event.is_set()):
             try:
                 chunk = self._q.get(timeout=0.2)
+                last = time.monotonic()
             except queue.Empty:
+                if not self.wanted:                      # privacy pause: stream closed on purpose
+                    yield silence
+                    continue
+                stalled = time.monotonic() - last
+                if stalled > self.STALL_S:
+                    st = self._stream
+                    why = "поток не активен" if st is None or not getattr(st, "active", True) else \
+                        f"нет звука {stalled:.0f} с"
+                    self.reopen(why)
+                    last = time.monotonic()
+                for _ in range(max(1, int(200 / max(1, self.frame_ms)))):
+                    yield silence
                 continue
             if self._dev_rate != self.rate:
                 chunk = resample(chunk, self._dev_rate, self.rate)

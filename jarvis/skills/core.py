@@ -55,6 +55,9 @@ def say_date(now: _dt.datetime) -> str:
     return f"Сегодня {WEEKDAYS[now.weekday()]}, {now.day} {MONTHS_GEN[now.month - 1]} {now.year} года."
 
 
+HELP_RE = re.compile(r"^(?:а )?(?:что ты (?:умеешь|можешь)(?: делать)?|какие (?:есть )?команды|список команд|"
+                     r"помощь|справка|что ты умеешь делать)$")
+MEDIA_OR_EXIT = {"стоп", "стоп стоп", "хватит", "замолчи"}   # pause media if something plays
 EXIT_PHRASES = {
     "стоп", "выход", "выйти", "выключись", "отключись", "завершить работу", "заверши работу",
     "закройся", "до свидания", "стоп стоп", "выключайся", "exit", "quit",
@@ -126,6 +129,17 @@ class CoreSkill(Skill):
 
     def match(self, text: str, t: str) -> Optional[ToolResult]:
         words = t.split()
+        if HELP_RE.match(t):
+            from ..helpinfo import spoken_summary
+            opener = self.ctx.extra.get("open_settings")
+            if opener:
+                opener("help")
+            return ToolResult(spoken_summary())
+        if t in MEDIA_OR_EXIT:
+            from .. import uia
+            if uia.media_playing():           # music/video is playing: «стоп» means the media, not Jarvis
+                ok = pu.press_media_key("play_pause")
+                return ToolResult("Поставил на паузу." if ok else "Медиаклавиши работают только в Windows.")
         if t in EXIT_PHRASES or (len(words) <= 3 and words[0] in EXIT_FIRST_WORDS):
             return ToolResult("Окей, отключаюсь. Пока!", action="exit")
         if any(p in t for p in RESET_PHRASES):

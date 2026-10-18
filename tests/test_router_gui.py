@@ -39,7 +39,7 @@ def test_all_modules_load_or_degrade(router):
 @pytest.mark.parametrize("phrase,skill_reply", [
     ("переведи на английский привет как дела", "Hello, how are you?"),
     ("какая температура компьютера", None),
-    ("диктовка", "Диктую"),
+    ("диктовка", "Пишу в активное окно"),
     ("найди файл отчёт", None),
 ])
 def test_routes(router, phrase, skill_reply):
@@ -78,7 +78,7 @@ def test_settings_dialog_offscreen(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "save_local_settings", lambda ch: saved.update(ch))
     cfg = load_config(use_local=False)
     dlg = st.SettingsDialog(cfg)
-    assert dlg.tabs.count() == 13
+    assert dlg.tabs.count() == 14                     # 1.0.7: + «Что я умею»
     ch = dlg.collect()
     assert dlg.validate(ch) == [], dlg.validate(ch)
     assert ch["assistant"]["name"] == "Джарвис" and ch["gui"]["hotkey_mic"] == "ctrl+alt+m"

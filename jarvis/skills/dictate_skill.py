@@ -7,12 +7,33 @@ import threading
 import time
 from typing import Optional
 
+from .. import keyinput
 from .base import Skill, ToolResult
 
 log = logging.getLogger(__name__)
 
-START_RE = re.compile(r"^(диктовка|начни диктовку|режим диктовки|печатай|пиши за мной|набирай текст)$")
-STOP_RE = re.compile(r"\b(стоп диктовка|конец диктовки|хватит печатать|закончи диктовку|стоп печать)\b")
+START_RE = re.compile(r"^(диктовка|начни диктовку|режим диктовки|печатай|пиши|пиши за мной|набирай текст|"
+                      r"начинай писать|давай пиши|диктую)$")
+STOP_RE = re.compile(r"\b(стоп диктовка|конец диктовки|хватит печатать|хватит писать|закончи диктовку|стоп печать|"
+                     r"выключи диктовку|выйди из диктовки)\b")
+STOP_ALONE = re.compile(r"^(хватит|закончи|заканчивай|всё|все|стоп|конец|стоп стоп)$")
+# «напиши привет, как дела?» -> types «привет, как дела?» once. The verb is cut from the ORIGINAL text so whisper's
+# punctuation and capitals survive. «напиши письмо маме» (LLM content) is not ours: only literal text after the verb.
+ONCE_RE = re.compile(r"^\s*(?:джарвис[,!]?\s+)?(?:на)?пиш(?:и|ите)(?:\s+(?:мне|текст|туда|тут|здесь))?[\s,:—-]+(.+)$",
+                     re.I | re.S)
+NOT_LITERAL = re.compile(r"^(письмо|сообщение|стих\w*|сочинение|эссе|код|программ\w*|скрипт\w*|функци\w*|рассказ\w*|"
+                         r"пост\w*|статью|отзыв\w*|резюме|поздравлени\w*|историю|песню|текст (?:про|о|об)\b|"
+                         r"в телеграм\w*|в телегу|в чат|напоминани\w*|заметк\w*)\b", re.I)
+# voice sub-commands while dictating (whole utterance)
+SUBCMDS = [
+    (re.compile(r"^(новая строка|новую строку|с новой строки|абзац|новый абзац|энтер|enter|ввод)$"), "enter"),
+    (re.compile(r"^(отправь|отправить|отправляй|отправка)$"), "enter"),
+    (re.compile(r"^(удали слово|сотри слово|удали последнее слово|назад слово)$"), "ctrl+backspace"),
+    (re.compile(r"^(удали|сотри)$"), "backspace"),
+    (re.compile(r"^(отмени|отмена)$"), "ctrl+z"),
+]
+OTHER_SKILL = re.compile(r"\b(телеграм\w*|телеге|телегу|телега|тг|скетч\w*|прошивк\w*)\b")  # telegram/code skills
+IDLE_EXIT_S = 30.0
 PUNCT = [
     (r"\s*\bновая строка\b\s*", "\n"), (r"\s*\bновый абзац\b\s*", "\n\n"),
     (r"\s*\bвосклицательный знак\b", "!"), (r"\s*\bвопросительный знак\b", "?"),
@@ -34,7 +55,7 @@ def apply_punctuation(text: str) -> str:
 
 
 def paste_text(text: str) -> bool:
-    """Put text into the clipboard, press Ctrl+V in the focused window, restore the old clipboard."""
+    """Fallback: put text into the clipboard, press Ctrl+V in the focused window, restore the old clipboard."""
     try:
         import keyboard
         import pyperclip
@@ -63,37 +84,93 @@ def paste_text(text: str) -> bool:
 class DictateSkill(Skill):
     name = "dictate"
 
-    def __init__(self, ctx):
+    def __init__(self, ctx, clock=time.monotonic, typer=None, presser=None):
         super().__init__(ctx)
         self.active = False
         self.first = True
+        self.clock = clock
+        self.last = 0.0
+        self.type = typer or self._type
+        self.press = presser or keyinput.press
 
+    # ---- modal state; wakeflow listens without the wake word while this is True
     @property
     def awaiting(self) -> bool:
+        if self.active and self.clock() - self.last > IDLE_EXIT_S:
+            self.active = False
+            log.info("Диктовка: %d с тишины — выхожу", IDLE_EXIT_S)
+            try:
+                self.ctx.notify("Джарвис", "Диктовка окончена (тишина).")
+            except Exception:                                # noqa: BLE001
+                pass
         return self.active
 
+    @property
+    def awaiting_timeout(self) -> Optional[float]:
+        """How long wakeflow may wait for the next phrase before re-checking (silence auto-exit)."""
+        return max(1.0, IDLE_EXIT_S - (self.clock() - self.last)) if self.active else None
+
+    def _start(self) -> str:
+        self.active, self.first, self.last = True, True, self.clock()
+        return "Пишу в активное окно. Скажи «хватит», чтобы закончить."
+
     def toggle(self) -> str:
-        self.active = not self.active
-        self.first = True
-        return "Диктую в активное окно. Скажи «стоп диктовка», чтобы закончить." if self.active else "Диктовка окончена."
+        if self.active:
+            self.active = False
+            return "Диктовка окончена."
+        return self._start()
+
+    # ---- output
+    def _wm(self):
+        return self.ctx.extra.get("wm")
+
+    def _type(self, text: str) -> bool:
+        wm = self._wm()
+        if wm is not None and getattr(wm, "b", None) is not None:
+            if keyinput.focus_target(wm) is None:
+                return False                                 # only Jarvis is focused: never type into ourselves
+        return keyinput.type_text(text) or paste_text(text)
+
+    def _out(self, chunk: str) -> Optional[ToolResult]:
+        if not self.type(chunk):
+            self.active = False
+            return ToolResult("Не вижу окна, куда писать. Кликни в нужное поле и скажи ещё раз.")
+        return None
 
     def handle_modal(self, text: str, t: str) -> Optional[ToolResult]:
+        self.last = self.clock()
+        if STOP_ALONE.match(t):
+            self.active = False
+            return ToolResult("Диктовка окончена.")
+        for rx, combo in SUBCMDS:
+            if rx.match(t):
+                self.press(combo)
+                if combo == "enter":
+                    self.first = True
+                return ToolResult("")
         m = STOP_RE.search(t)
         if m:
-            before = text[: text.lower().find(m.group(1))].strip()
+            low = text.lower()
+            k = low.find(m.group(1))
+            before = text[:k].strip() if k >= 0 else ""
             if before:
-                paste_text(("" if self.first else " ") + apply_punctuation(before))
+                self._out(("" if self.first else " ") + apply_punctuation(before))
             self.active = False
             return ToolResult("Диктовка окончена.")
         chunk = apply_punctuation(text)
+        if not chunk:
+            return ToolResult("")
         if not self.first and not chunk.startswith("\n"):
             chunk = " " + chunk
         self.first = False
-        paste_text(chunk)
-        return ToolResult("")
+        return self._out(chunk) or ToolResult("")
 
     def match(self, text: str, t: str) -> Optional[ToolResult]:
         if START_RE.match(t):
-            self.active, self.first = True, True
-            return ToolResult("Диктую в активное окно. Скажи «стоп диктовка», чтобы закончить.")
+            return ToolResult(self._start())
+        m = ONCE_RE.match(text or "")
+        if m and t.startswith(("напиши", "напишите", "пиши ", "джарвис")):
+            body = m.group(1).strip()
+            if body and not NOT_LITERAL.match(body) and not OTHER_SKILL.search(t):
+                return self._out(body) or ToolResult("")
         return None

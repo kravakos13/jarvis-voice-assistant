@@ -32,7 +32,7 @@ DEFAULTS: dict[str, Any] = {
                   "request_timeout_s": 6, "request_silence_ms": 1200, "max_request_s": 15, "tts_tail_ms": 500,
                   "ack_after_s": 2.5},
     "stt": {"model": "small", "device": "cpu", "compute_type": "auto", "language": "ru", "beam_size": 1,
-            "download_root": "models/whisper", "initial_prompt": "Джарвис, привет."},
+            "download_root": "models/whisper", "initial_prompt": "", "vad_filter": True},
     "audio": {"input_device": None, "output_device": None, "sample_rate": 16000, "vad": "webrtc",
               "vad_aggressiveness": 2, "energy_threshold": 0.015, "frame_ms": 30, "silence_ms": 800,
               "min_speech_ms": 250, "max_utterance_s": 15, "pre_roll_ms": 300},
@@ -45,6 +45,8 @@ DEFAULTS: dict[str, Any] = {
             "volume": 1.0, "pyttsx3_rate": 180, "pyttsx3_voice": "", "speak_in_text_mode": True},
     "tools": {"enabled": True, "websites": {}, "apps": {}},
     "windows": {"enabled": True},
+    "explorer": {"enabled": True},
+    "hotkeys": {"enabled": True},
     "gui": {"enabled": True, "always_on_top": False, "start_minimized": False, "close_to_tray": True,
             "hotkey_show": "ctrl+alt+j", "hotkey_ptt": "ctrl+alt+space", "hotkey_game": "ctrl+alt+g", "fps": 30},
     "autostart": {"enabled": True},
@@ -75,7 +77,8 @@ def _read_yaml(path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
-CONFIG_VERSION = 6
+CONFIG_VERSION = 7
+OLD_PROMPT = "Джарвис, привет. Джарвис, включи музыку."
 REMOVED_SECTIONS = ("whatsapp", "comfyui", "faceswap", "video")
 
 
@@ -132,6 +135,13 @@ def migrate_local(data) -> tuple[dict, bool]:
                 stt.pop("compute_type")           # GPU-only types fail on the CPU fallback -> auto
         data["config_version"] = 6
         changed = True
+    if ver < 7:                                   # 1.0.7: the old default prompt made Whisper «hear» «Джарвис, привет»
+        stt = data.get("stt")
+        if isinstance(stt, dict) and ("привет" in str(stt.get("initial_prompt", "")).lower()
+                                      or str(stt.get("initial_prompt", "")).strip() == OLD_PROMPT):
+            stt.pop("initial_prompt")             # greeting-like prompts are echoed by Whisper as phantom input
+        data["config_version"] = 7
+        changed = True
     return data, changed
 
 
@@ -185,8 +195,10 @@ def load_config(path: str | os.PathLike | None = None, use_local: bool = True) -
     # the prompt may reference the configurable names
     a = cfg["assistant"]
     cfg["llm"]["system_prompt"] = render_prompt(cfg)
-    if a.get("name") and a["name"] not in str(cfg["stt"].get("initial_prompt") or ""):
-        cfg["stt"]["initial_prompt"] = f"{a['name']}, привет. " + str(cfg["stt"].get("initial_prompt") or "")
+    # 1.0.7: the name goes to Whisper as a HOTWORD. Until 1.0.6 «{name}, привет.» was prepended to initial_prompt and
+    # Whisper echoed it on noise -> phantom «Джарвис, привет.» commands (seen in users' logs).
+    if a.get("name") and not cfg["stt"].get("hotwords"):
+        cfg["stt"]["hotwords"] = str(a["name"])
     return cfg
 
 

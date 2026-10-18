@@ -27,6 +27,10 @@ _RU_MONTHS_GEN = ["января", "февраля", "марта", "апреля"
                   "сентября", "октября", "ноября", "декабря"]
 
 
+RETRY_TIMEOUT_S = 25.0        # the «answer in Russian» retry: hard cap (was 600 s)
+RETRY_MAX_TOKENS = 160        # a spoken answer; a runaway degenerate generation must not run to num_ctx
+FALLBACK_RU = "Не расслышал, повтори, пожалуйста."
+
 class LLMError(RuntimeError):
     pass
 
@@ -100,7 +104,7 @@ class OllamaChat:
         self.host = str(cfg.get("host", "http://localhost:11434")).rstrip("/")
         self.model = cfg.get("model", "qwen2.5:7b")
         self.system_prompt = cfg.get("system_prompt", "")
-        self.temperature = float(cfg.get("temperature", 0.6))
+        self.temperature = float(cfg.get("temperature", 0.5))
         self.num_ctx = max(2048, int(cfg.get("num_ctx", 6144)))
         self.num_predict = int(cfg.get("num_predict", 512))          # voice answers are short
         self.top_p = float(cfg.get("top_p", 0.9))
@@ -108,6 +112,7 @@ class OllamaChat:
         self.repeat_penalty = float(cfg.get("repeat_penalty", 1.1))
         self.max_history = int(cfg.get("max_history_messages", 16))
         self.timeout = float(cfg.get("timeout_s", 120))
+        self.turn_timeout = float(cfg.get("turn_timeout_s", 90))   # whole streamed answer, incl. slow CPU prompt
         self.keep_alive = cfg.get("keep_alive", "30m")
         # extra models (coder, vision) are unloaded quickly to fit into 6 GB VRAM
         self.aux_keep_alive = cfg.get("aux_keep_alive", "1m")
@@ -266,7 +271,8 @@ class OllamaChat:
 
     # ---------------------------------------------------------------- chat
     def _post_stream(self, payload: dict) -> Iterator[dict]:
-        with self.http.post(f"{self.host}/api/chat", json=payload, stream=True, timeout=self.timeout) as r:
+        with self.http.post(f"{self.host}/api/chat", json=payload, stream=True,
+                            timeout=(10, min(self.timeout, self.turn_timeout))) as r:
             if r.status_code != 200:
                 raise LLMError(f"Ollama вернула {r.status_code}: {r.text[:300]}")
             for line in r.iter_lines():
@@ -303,8 +309,11 @@ class OllamaChat:
             payload["tools"] = tools
         parts: list[str] = []
         calls: list[dict] = []
+        deadline = time.monotonic() + self.turn_timeout
         try:
             for data in self._post_stream(payload):
+                if time.monotonic() > deadline:
+                    raise LLMError(f"timeout: ответ дольше {self.turn_timeout:.0f} с — прерываю")
                 msg = data.get("message") or {}
                 for tc in msg.get("tool_calls") or []:
                     fn = tc.get("function") or {}
@@ -348,16 +357,25 @@ class OllamaChat:
     def ask(self, user_text: str) -> str:
         return strip_think("".join(self.stream(user_text))).strip()
 
-    def regenerate_russian(self) -> str:
-        """The streamed answer drifted (CJK / not Russian): ask again with a corrective instruction.
-        The history ends with the user's message (the drifted answer was not stored). Stores the result."""
+    def regenerate_russian(self, timeout: float = RETRY_TIMEOUT_S) -> str:
+        """The streamed answer drifted (CJK / not Russian): ask again ONCE with a corrective instruction.
+        Hard limits (1.0.7): RETRY_TIMEOUT_S and RETRY_MAX_TOKENS, no nested retry — in 1.0.6 this request had a
+        600 s timeout and no token cap, so a degenerate generation on CPU blocked Jarvis for many minutes
+        (the «falls asleep» bug). Any failure -> a short Russian fallback. Stores the result."""
         if self.history and self.history[-1]["role"] == "assistant" and (
                 has_cjk(self.history[-1]["content"]) or not_russian(self.history[-1]["content"])):
             self.history.pop()                       # never keep (or learn from) the drifted answer
         system = self._system_message()
-        msgs = self._messages(system, None) + [{"role": "user", "content": CORRECTION}]
-        out = self.complete(msgs, temperature=0.3, lang="ru", _ru_rule=False)
-        out = out or "Извини, сбился. Повтори, пожалуйста."
+        msgs = self._with_ru_rule(self._messages(system, None) + [{"role": "user", "content": CORRECTION}])
+        try:
+            out = self._complete_once(msgs, None, None, 0.3, None, timeout, num_predict=RETRY_MAX_TOKENS)
+        except LLMError as e:
+            log.warning("LLM: повторный ответ по-русски не получен: %s", e)
+            out = ""
+        if has_cjk(out) or not_russian(out):
+            log.warning("LLM: и повтор не по-русски (%r) — короткий ответ", out[:60])
+            out = ""
+        out = out or FALLBACK_RU
         self.history.append({"role": "assistant", "content": out})
         self._trim()
         return out
@@ -395,7 +413,8 @@ class OllamaChat:
         return strip_cjk(out) if lang != "any" and has_cjk(out) else out
 
     def _complete_once(self, messages: list[dict], model: Optional[str], fmt: Optional[str],
-                       temperature: Optional[float], num_ctx: Optional[int], timeout: Optional[float]) -> str:
+                       temperature: Optional[float], num_ctx: Optional[int], timeout: Optional[float],
+                       num_predict: Optional[int] = None) -> str:
         main = (model or self.model) == self.model
         payload = {
             "model": model or self.model,
@@ -405,6 +424,8 @@ class OllamaChat:
             # a different num_ctx would make Ollama RELOAD the main model (seconds) -> always the same one
             "options": self.options(temperature, None if main else num_ctx),
         }
+        if num_predict:
+            payload["options"]["num_predict"] = int(num_predict)
         if fmt:
             payload["format"] = fmt
         try:

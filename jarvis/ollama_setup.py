@@ -178,7 +178,18 @@ SERVER_ENV = {"OLLAMA_FLASH_ATTENTION": "1",   # less VRAM for attention; needed
 def _serve_env(host: str, extra: Optional[dict] = None) -> dict:
     """Environment for an Ollama started by Jarvis. The user's own OLLAMA_* variables always win."""
     env = dict(os.environ)
-    for k, v in (SERVER_ENV if extra is None else extra).items():
+    wanted = dict(SERVER_ENV if extra is None else extra)
+    try:
+        from .cuda_libs import nvidia_gpu_present
+        gpu = nvidia_gpu_present()
+    except Exception:                                    # noqa: BLE001
+        gpu = True
+    if not gpu:
+        # CPU-only: q8 KV cache + flash attention save VRAM there is none of, and on some CPU builds they degrade
+        # qwen2.5 output (garbage like «根据赛斯沃… onCreateViewHolder» in users' logs) -> plain f16 KV on CPU.
+        for k in ("OLLAMA_KV_CACHE_TYPE", "OLLAMA_FLASH_ATTENTION"):
+            wanted.pop(k, None)
+    for k, v in wanted.items():
         if v is not None and str(v) != "" and k not in os.environ:
             env[str(k)] = str(v)
     port = urllib.parse.urlparse(host).port

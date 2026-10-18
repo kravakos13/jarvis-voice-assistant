@@ -128,7 +128,8 @@ class SettingsDialog(QDialog):
                                ("Интерфейс", self._tab_ui), ("Режимы", self._tab_modes),
                                ("Интеграции", self._tab_integrations), ("Игры", self._tab_games),
                                ("Аудиоустройства", self._tab_audio), ("Модули", self._tab_modules),
-                               ("Бэкап и синхронизация", self._tab_backup), ("О программе", self._tab_about)):
+                               ("Бэкап и синхронизация", self._tab_backup), ("Что я умею", self._tab_help),
+                               ("О программе", self._tab_about)):
             try:
                 self.tabs.addTab(self._scroll(builder()), title)
             except Exception as e:      # one broken tab must not break the window
@@ -862,6 +863,19 @@ class SettingsDialog(QDialog):
                          "Перед каждой синхронизацией делается бэкап."))
         return w
 
+    def _tab_help(self) -> QWidget:
+        from PySide6.QtWidgets import QTextBrowser
+
+        from ..helpinfo import as_html
+        w = QWidget()
+        v = QVBoxLayout(w)
+        tb = QTextBrowser()
+        tb.setOpenExternalLinks(True)
+        tb.setHtml(as_html())
+        tb.setMinimumHeight(520)
+        v.addWidget(tb)
+        return w
+
     def _tab_about(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
@@ -1305,7 +1319,8 @@ class SettingsDialog(QDialog):
         threading.Thread(target=work, daemon=True).start()
 
     def select_tab(self, key: str) -> None:
-        names = {"integrations": "Интеграции", "ui": "Интерфейс", "backup": "Бэкап и синхронизация"}
+        names = {"integrations": "Интеграции", "ui": "Интерфейс", "backup": "Бэкап и синхронизация",
+                 "help": "Что я умею"}
         title = names.get(key, key)
         for i in range(self.tabs.count()):
             if self.tabs.tabText(i) == title:

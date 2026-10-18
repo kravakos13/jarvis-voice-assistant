@@ -82,6 +82,9 @@ class SpeechToText:
         self.language = cfg.get("language", "ru")
         self.beam_size = int(cfg.get("beam_size", 1))
         self.initial_prompt = cfg.get("initial_prompt") or None
+        self.vad_filter = bool(cfg.get("vad_filter", True))
+        self.hotwords = str(cfg.get("hotwords") or "") or None
+        self.min_level = float(cfg.get("min_level", MIN_LEVEL))
         _add_windows_cuda_dlls()
         self.requested = (cfg.get("device") or "auto").lower()
         device, compute = pick_device(self.requested, cfg.get("compute_type", "auto"))
@@ -183,37 +186,114 @@ class SpeechToText:
             audio = audio.astype(np.float32, copy=False)
             if audio.size < 1600:  # < 0.1 s
                 return ""
+            loud = speech_level(audio)
+            if loud < getattr(self, "min_level", MIN_LEVEL):
+                log.debug("STT пропущено: тихо/шум (уровень %.4f < %.4f), Whisper не запускаю", loud,
+                          getattr(self, "min_level", MIN_LEVEL))
+                return ""
         elif isinstance(audio, Path):
             audio = str(audio)
         t0 = time.time()
-        segments, _info = self.model.transcribe(
-            audio,
-            language=self.language if language == "default" else language,   # None = auto-detect
-            beam_size=self.beam_size,
-            initial_prompt=self.initial_prompt if language in ("default", "ru") else None,
-            condition_on_previous_text=False,
-            vad_filter=False,
-            without_timestamps=True,
-        )
-        text = " ".join(s.text.strip() for s in segments if s.no_speech_prob < 0.8).strip()
+        kw = dict(language=self.language if language == "default" else language,   # None = auto-detect
+                  beam_size=self.beam_size,
+                  initial_prompt=self.initial_prompt if language in ("default", "ru") else None,
+                  hotwords=getattr(self, "hotwords", None) if language in ("default", "ru") else None,
+                  condition_on_previous_text=False,          # no carry-over of earlier (possibly phantom) text
+                  no_speech_threshold=NO_SPEECH_MAX, log_prob_threshold=LOGPROB_MIN,
+                  compression_ratio_threshold=2.4, without_timestamps=True)
+        if self.vad_filter:
+            kw.update(vad_filter=True, vad_parameters=VAD_PARAMS)   # Silero VAD: no speech -> no decoding at all
+        try:
+            segments, _info = self.model.transcribe(audio, **kw)
+            segs = list(segments)
+        except Exception as e:
+            if not self.vad_filter or "vad" not in str(e).lower() and "onnx" not in str(e).lower():
+                raise
+            log.warning("Silero VAD недоступен (%s) — распознаю без него", e)
+            self.vad_filter = False
+            kw.pop("vad_parameters", None)
+            kw["vad_filter"] = False
+            segments, _info = self.model.transcribe(audio, **kw)
+            segs = list(segments)
+        text = accept(segs, self.initial_prompt, getattr(self, "hotwords", None))
         log.debug("STT %.2f с: %r", time.time() - t0, text)
-        return _drop_hallucinations(text)
+        return text
 
 
-# Typical Whisper hallucinations on silence/noise in Russian
+MIN_LEVEL = 0.004              # RMS of the loudest 10% of 30 ms frames; speech is ~0.02-0.3, room noise < 0.003
+
+
+def speech_level(audio) -> float:
+    """Cheap energy gate before Whisper: noise that fooled the webrtc VAD costs 2-3 s of CPU per phrase."""
+    n = 480
+    k = audio.size // n
+    if k == 0:
+        return float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
+    rms = np.sqrt(np.mean(audio[: k * n].reshape(k, n) ** 2, axis=1))
+    return float(np.percentile(rms, 90))
+
+
+NO_SPEECH_MAX = 0.6            # whisper's own "silence" probability; above -> segment dropped
+LOGPROB_MIN = -1.0             # average token log-probability; below = whisper is guessing
+LOGPROB_HARD = -1.4            # always dropped below this, even if no_speech is low
+VAD_PARAMS = {"threshold": 0.5, "min_speech_duration_ms": 200, "min_silence_duration_ms": 500, "speech_pad_ms": 200}
+# whole-phrase hallucinations: dropped when the phrase is ONLY this and whisper is not confident about it
+STANDALONE = {"привет", "спасибо", "спасибо большое", "спасибо за внимание", "пока", "да", "угу", "ага", "ну",
+              "так", "всё", "все", "хорошо", "окей", "ок", "здравствуйте", "до свидания", "ммм", "м", "а", "о",
+              "аплодисменты", "музыка", "смех", "тишина", "you", "thank you", "thanks for watching", "bye"}
+STANDALONE_CONF = -0.45        # «привет» must be clearly heard (avg_logprob above this) to pass
+STANDALONE_NOSPEECH = 0.25
+
+
+def _plain(s: str) -> str:
+    import re as _re
+    return " ".join(_re.sub(r"[^\w\s]", " ", (s or "").lower().replace("ё", "е")).split())
+
+
+def accept(segments, prompt: str | None = None, hotwords: str | None = None) -> str:
+    """Whisper segments -> text, without the usual phantom output on silence/noise. Drops are logged at debug."""
+    kept, conf, nos = [], [], []
+    for sg in segments:
+        t = (getattr(sg, "text", "") or "").strip()
+        ns = float(getattr(sg, "no_speech_prob", 0.0) or 0.0)
+        lp = float(getattr(sg, "avg_logprob", 0.0) or 0.0)
+        if not t:
+            continue
+        if ns > NO_SPEECH_MAX and lp < LOGPROB_MIN or ns > 0.8 or lp < LOGPROB_HARD:
+            log.debug("STT отброшено (no_speech=%.2f, logprob=%.2f): %r", ns, lp, t)
+            continue
+        kept.append(t)
+        conf.append(lp)
+        nos.append(ns)
+    text = " ".join(kept).strip()
+    if not text:
+        return ""
+    plain = _plain(text)
+    if any(h in plain for h in _HALLUCINATIONS):
+        log.debug("STT отброшено (типичная галлюцинация): %r", text)
+        return ""
+    if plain in STANDALONE and (min(conf) < STANDALONE_CONF or max(nos) > STANDALONE_NOSPEECH):
+        log.debug("STT отброшено (одно слово, неуверенно: logprob=%.2f): %r", min(conf), text)
+        return ""
+    if hotwords and plain in _plain(hotwords).split() and (min(conf) < STANDALONE_CONF or max(nos) > STANDALONE_NOSPEECH):
+        log.debug("STT отброшено (эхо hotword, неуверенно): %r", text)
+        return ""
+    if prompt and len(plain) >= 4 and plain in _plain(prompt):
+        log.debug("STT отброшено (эхо подсказки initial_prompt): %r", text)
+        return ""
+    return text
+
+
+# Typical Whisper hallucinations on silence/noise in Russian (training data = subtitled videos); substrings
 _HALLUCINATIONS = (
-    "продолжение следует",
-    "субтитры сделал",
-    "субтитры создавал",
-    "редактор субтитров",
-    "спасибо за просмотр",
-    "подписывайтесь на канал",
-    "dimatorzok",
+    "продолжение следует", "субтитры сделал", "субтитры создавал", "субтитры подготовил", "субтитры делал",
+    "редактор субтитров", "корректор субтитров", "диматор", "dimatorzok", "диматорзок", "спасибо за просмотр",
+    "подписывайтесь на канал", "подпишись на канал", "подписывайтесь на наш канал", "ставьте лайк",
+    "ставьте лайки", "до новых встреч", "amara org", "субтитры от", "игорь негода", "а семкин", "с вами был",
+    "спасибо что смотрите", "всем пока", "благодарю за внимание",
 )
 
 
 def _drop_hallucinations(text: str) -> str:
-    low = text.lower()
-    if any(h in low for h in _HALLUCINATIONS):
-        return ""
-    return text
+    plain = _plain(text)
+    return "" if any(h in plain for h in _HALLUCINATIONS) else text

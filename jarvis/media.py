@@ -55,24 +55,35 @@ class Media:
         self.ytmusic = ChromeApp("YouTube Music", YTM_URL, self.cfg.get("ytmusic_app", {}), self.chrome, launcher)
         self._spawn = launcher
         self._open_url = opener
+        from .ytpick import Picker
+        self.picker = Picker(self)            # «включи второе видео» on the list Jarvis / the user opened
 
     # ------------------------------------------------------------ search helpers (internet needed)
     @staticmethod
-    def search_music(query: str) -> Optional[dict]:
-        """First YouTube Music song for the query -> {'id','title','artist'} (no login)."""
+    def search_music_list(query: str, limit: int = 10) -> list[dict]:
+        """YouTube Music songs for the query, in order -> [{'id','title','artist'}] (no login)."""
         try:
             from ytmusicapi import YTMusic
             yt = YTMusic(language="ru", location="RU")
             for flt in ("songs", "videos", None):
-                res = yt.search(query, filter=flt, limit=5) if flt else yt.search(query, limit=5)
+                res = yt.search(query, filter=flt, limit=limit) if flt else yt.search(query, limit=limit)
+                out = []
                 for r in res:
                     vid = r.get("videoId")
                     if vid:
                         artists = ", ".join(a.get("name", "") for a in (r.get("artists") or []) if a.get("name"))
-                        return {"id": vid, "title": r.get("title", query), "artist": artists}
+                        out.append({"id": vid, "title": r.get("title", query), "artist": artists, "channel": artists})
+                if out:
+                    return out
         except Exception as e:
             log.warning("ytmusicapi: %s - пробую yt-dlp", e)
-        return Media.search_youtube(query)
+        return []
+
+    @staticmethod
+    def search_music(query: str) -> Optional[dict]:
+        """First YouTube Music song for the query -> {'id','title','artist'} (no login)."""
+        hits = Media.search_music_list(query, limit=5)
+        return hits[0] if hits else Media.search_youtube(query)
 
     @staticmethod
     def search_youtube(query: str) -> Optional[dict]:
@@ -105,21 +116,29 @@ class Media:
         if not query:
             self.ytmusic.open()
             return "Открываю ютуб музыку."
-        hit = self.search_music(query)
+        hits = self.search_music_list(query)
+        hit = hits[0] if hits else self.search_youtube(query)
         if not hit or not hit.get("id"):
             self.ytmusic.open(f"{YTM_URL}/search?q={urllib.parse.quote(query)}")
             return f"Не нашёл точного трека, открыл поиск: {query}."
         self.ytmusic.open(f"{YTM_URL}/watch?v={hit['id']}")
+        if hits:                              # «включи второй трек» -> the 2nd song of this search
+            self.picker.remember(f"{YTM_URL}/search?q={urllib.parse.quote(query)}", query, hits, music=True, current=0)
         who = f" — {hit['artist']}" if hit.get("artist") else ""
         return f"Включаю {hit['title']}{who}."
 
     def youtube_search(self, query: str, play_first: bool = False) -> str:
+        from .ytpick import fetch_list, search_url
+        url = search_url(query)
         if play_first:
-            hit = self.search_youtube(query)
+            items = fetch_list(url)               # the same ordered list «второе/следующее» will use
+            hit = items[0] if items else self.search_youtube(query)
             if hit and hit.get("id"):
                 self.youtube.open(f"{YT_URL}/watch?v={hit['id']}")
+                self.picker.remember(url, query, items or [hit], current=0)
                 return f"Включаю видео: {hit['title']}."
-        self.youtube.open(f"{YT_URL}/results?search_query={urllib.parse.quote_plus(query)}")
+        self.youtube.open(url)
+        self.picker.remember(url, query)          # fetched in the background for «включи второе»
         return f"Ищу на ютубе: {query}."
 
     def google_search(self, query: str) -> str:

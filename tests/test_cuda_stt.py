@@ -47,7 +47,7 @@ def fake_whisper(monkeypatch):
     return FakeWhisper
 
 
-AUDIO = np.zeros(16000, np.float32)
+AUDIO = (np.sin(np.arange(16000) / 5) * 0.1).astype(np.float32)   # speech-level (1.0.7 energy gate)
 
 
 def test_auto_probe_really_runs_the_model_and_falls_back_to_cpu(fake_whisper):
@@ -167,7 +167,7 @@ def test_migration_v6_back_to_cpu_default():
     assert C.DEFAULTS["stt"]["device"] == "cpu"
     for dev in ("cuda", "auto"):
         d, ch = C.migrate_local({"config_version": 5, "stt": {"device": dev, "compute_type": "int8_float16", "model": "small"}})
-        assert ch and d["stt"] == {"model": "small"} and d["config_version"] == C.CONFIG_VERSION == 6
+        assert ch and d["stt"] == {"model": "small"} and d["config_version"] == C.CONFIG_VERSION >= 6
     d, _ = C.migrate_local({"config_version": 5, "stt": {"device": "cpu", "compute_type": "int8"}})
     assert d["stt"] == {"device": "cpu", "compute_type": "int8"}
 
@@ -249,3 +249,10 @@ def test_users_manual_cpu_override_survives_upgrade(tmp_path, monkeypatch):
     import yaml
     saved = yaml.safe_load(local.read_text(encoding="utf-8"))
     assert saved["stt"] == {"device": "cpu", "compute_type": "int8"} and saved["gui"] == {"face_image": "custom"}
+
+
+def test_assistant_has_stt_before_init_sets_it():
+    """user log 17:56-18:07 (1.0.5): «VRAM: 'Assistant' object has no attribute 'stt'» — set_profile runs first."""
+    from jarvis.assistant import Assistant
+    a = Assistant.__new__(Assistant)
+    assert a.stt is None

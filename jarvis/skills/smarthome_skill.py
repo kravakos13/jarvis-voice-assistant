@@ -49,6 +49,9 @@ class SmartHomeSkill(Skill):
             return None
         m = SWITCH_RE.match(t)
         if m:
+            from ..ytpick import parse_pick
+            if parse_pick(t):                 # «включи второе видео» is a YouTube pick, not «реле 2»
+                return None
             return self.switch(m.group(2), m.group(1) in ("включи", "вруби", "зажги"))
         m = SENSOR_RE.search(t)
         if m and not re.search(r"на улице|погод|видеокарт|процессор", t):

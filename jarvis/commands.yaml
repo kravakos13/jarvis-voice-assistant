@@ -1,0 +1,198 @@
+# Голосовые команды-горячие клавиши (быстрый путь, без ИИ). Джарвис читает этот файл и, если есть,
+# %LOCALAPPDATA%\Jarvis\commands.yaml (ваши команды: тот же формат; одинаковый id заменяет встроенную).
+#
+#   id:       уникальное имя
+#   section:  раздел в списке «Что я умею» (Настройки)
+#   scope:    browser — только когда впереди браузер (Chrome/Edge/Firefox/Яндекс/Opera/Brave/Vivaldi);
+#             any — в активном окне (не в окне Джарвиса)
+#   phrases:  регулярные выражения на всю фразу (нижний регистр, без знаков препинания, ё -> е);
+#             (?P<n>...) — порядковый номер («вторая», «3»), (?P<q>...) — текст запроса
+#   keys:     комбинация («ctrl+shift+t»); keys_firefox: если в Firefox другая
+#   action:   tab_n | open_site | result_link | (нет — просто keys)
+#   times:    сколько раз нажать
+#   reply:    что ответить ("" — молча)
+#   example:  пример для списка «Что я умею»
+
+- id: new_tab
+  section: Браузер
+  scope: browser
+  phrases: ["(?:открой )?нов(?:ая|ую) вкладк[уа]", "новая страница"]
+  keys: ctrl+t
+  reply: ""
+  example: новая вкладка
+- id: reopen_tab
+  section: Браузер
+  scope: browser
+  phrases: ["верни (?:закрытую )?вкладку", "восстанови вкладку", "открой закрытую вкладку"]
+  keys: ctrl+shift+t
+  reply: ""
+  example: верни вкладку
+- id: next_tab
+  section: Браузер
+  scope: browser
+  phrases: ["следующая вкладка", "(?:на )?следующую вкладку", "вкладка (?:вправо|дальше)"]
+  keys: ctrl+tab
+  reply: ""
+  example: следующая вкладка
+- id: prev_tab
+  section: Браузер
+  scope: browser
+  phrases: ["предыдущая вкладка", "(?:на )?предыдущую вкладку", "вкладка (?:влево|назад)"]
+  keys: ctrl+shift+tab
+  reply: ""
+  example: предыдущая вкладка
+- id: tab_n
+  section: Браузер
+  scope: browser
+  phrases: ["(?:открой |перейди на |переключись на |покажи )?(?P<n>\\S+) вкладк[уаи]", "вкладка (?:номер )?(?P<n>\\S+)"]
+  action: tab_n
+  reply: ""
+  example: вторая вкладка
+- id: back
+  section: Браузер
+  scope: browser
+  phrases: ["назад", "вернись назад", "на страницу назад", "страница назад"]
+  keys: alt+left
+  reply: ""
+  example: назад
+- id: forward
+  section: Браузер
+  scope: browser
+  phrases: ["вперед", "страница вперед", "на страницу вперед"]
+  keys: alt+right
+  reply: ""
+  example: вперёд
+- id: reload
+  section: Браузер
+  scope: browser
+  phrases: ["обнови(?: страницу)?", "перезагрузи страницу", "обнови вкладку"]
+  keys: f5
+  reply: ""
+  example: обнови
+- id: scroll_down
+  section: Браузер
+  scope: any
+  phrases: ["листай вниз", "(?:про)?листай(?: ниже)?", "прокрути(?: вниз)?", "ниже", "скролл вниз", "вниз"]
+  keys: pagedown
+  reply: ""
+  example: листай вниз
+- id: scroll_up
+  section: Браузер
+  scope: any
+  phrases: ["листай вверх", "прокрути вверх", "скролл вверх"]
+  keys: pageup
+  reply: ""
+  example: листай вверх
+- id: to_top
+  section: Браузер
+  scope: any
+  phrases: ["в начало(?: страницы)?", "в самый верх", "наверх страницы"]
+  keys: ctrl+home
+  reply: ""
+  example: в начало
+- id: to_end
+  section: Браузер
+  scope: any
+  phrases: ["в конец(?: страницы)?", "в самый низ"]
+  keys: ctrl+end
+  reply: ""
+  example: в конец
+- id: fullscreen
+  section: Браузер
+  scope: browser
+  phrases: ["на весь экран", "полноэкранный режим", "во весь экран", "выйди из полноэкранного(?: режима)?"]
+  keys: f11
+  reply: ""
+  example: на весь экран
+- id: incognito
+  section: Браузер
+  scope: browser
+  phrases: ["(?:открой )?(?:окно )?инкогнито", "приватное окно", "режим инкогнито"]
+  keys: ctrl+shift+n
+  keys_firefox: ctrl+shift+p
+  reply: ""
+  example: инкогнито
+- id: zoom_in
+  section: Браузер
+  scope: browser
+  phrases: ["увеличь масштаб", "крупнее", "приблизь", "увеличь(?: страницу)?"]
+  keys: ctrl+plus
+  reply: ""
+  example: увеличь масштаб
+- id: zoom_out
+  section: Браузер
+  scope: browser
+  phrases: ["уменьши масштаб", "мельче", "отдали", "уменьши(?: страницу)?"]
+  keys: ctrl+minus
+  reply: ""
+  example: уменьши масштаб
+- id: zoom_reset
+  section: Браузер
+  scope: browser
+  phrases: ["обычный масштаб", "сбрось масштаб", "масштаб 100(?: процентов)?"]
+  keys: ctrl+0
+  reply: ""
+  example: обычный масштаб
+- id: open_site
+  section: Браузер
+  scope: any
+  phrases: ["(?:открой|зайди на|перейди на) сайт (?P<q>.+)"]
+  action: open_site
+  reply: "Открываю {q}."
+  example: открой сайт хабр
+- id: result_link
+  section: Браузер
+  scope: browser
+  phrases: ["(?:открой |нажми |кликни |перейди по )?(?P<n>\\S+) (?:ссылк[уа]|результат)", "(?:открой )?ссылк[уа] (?:номер )?(?P<n>\\S+)"]
+  action: result_link
+  reply: ""
+  example: открой вторую ссылку
+- id: copy
+  section: Окна и текст
+  scope: any
+  phrases: ["копируй", "скопируй(?: это)?", "копировать"]
+  keys: ctrl+c
+  reply: ""
+  example: копируй
+- id: paste
+  section: Окна и текст
+  scope: any
+  phrases: ["вставь(?: это)?", "вставить"]
+  keys: ctrl+v
+  reply: ""
+  example: вставь
+- id: select_all
+  section: Окна и текст
+  scope: any
+  phrases: ["выдели все", "выделить все"]
+  keys: ctrl+a
+  reply: ""
+  example: выдели всё
+- id: undo
+  section: Окна и текст
+  scope: any
+  phrases: ["отмени(?: это| действие| последнее)?", "отменить"]
+  keys: ctrl+z
+  reply: ""
+  example: отмени
+- id: redo
+  section: Окна и текст
+  scope: any
+  phrases: ["верни (?:как было|обратно)", "повтори действие"]
+  keys: ctrl+y
+  reply: ""
+  example: повтори действие
+- id: save
+  section: Окна и текст
+  scope: any
+  phrases: ["сохрани(?: это| файл| документ)?", "сохранить"]
+  keys: ctrl+s
+  reply: ""
+  example: сохрани
+- id: show_desktop
+  section: Окна и текст
+  scope: any
+  phrases: ["покажи рабочий стол", "рабочий стол", "сверни все окна"]
+  keys: win+d
+  reply: ""
+  example: покажи рабочий стол

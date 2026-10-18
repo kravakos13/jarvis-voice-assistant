@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Optional, Any, Callable
 
 log = logging.getLogger("jarvis.wake")
 
@@ -31,6 +31,7 @@ class WakeFlow:
     execute: Callable[[str], None]                       # run one request and speak the answer (blocking)
     emit: Callable[[str], None] = lambda state: None     # GUI/tray state
     awaiting: Callable[[], bool] = lambda: False         # a skill waits for an answer without the name
+    awaiting_timeout: Callable[[], Optional[float]] = lambda: None   # e.g. dictation: re-check after its idle limit
     cfg: dict = field(default_factory=dict)              # the "assistant" config section
     follow_allowed: Callable[[], bool] = lambda: True    # False in the game profile
     clock: Callable[[], float] = time.monotonic
@@ -66,7 +67,7 @@ class WakeFlow:
         now = self.clock()
         awaiting = self.awaiting()
         open_window = awaiting or now < self.follow_until
-        timeout = None if awaiting else (self.follow_until - now if open_window else None)
+        timeout = self.awaiting_timeout() if awaiting else (self.follow_until - now if open_window else None)
         audio = self.listen(timeout=timeout)
         if audio is None:
             self.follow_until = 0.0

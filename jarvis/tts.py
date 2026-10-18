@@ -17,6 +17,8 @@ from .llm import clean_for_speech
 log = logging.getLogger(__name__)
 
 
+SPEAK_MAX_S = 60.0             # no sentence takes a minute: longer = stuck (watchdog resets it)
+
 class PiperTTS:
     name = "piper"
 
@@ -203,6 +205,7 @@ class Speaker:
         self.volume = 1.0              # profile volume (night mode = quiet)
         self._interrupt = threading.Event()
         self._last_end = 0.0           # monotonic time the last sentence finished playing
+        self._started = 0.0            # monotonic time the current sentence started (0 = idle)
         self._thread = threading.Thread(target=self._run, name="jarvis-tts", daemon=True)
         self._thread.start()
 
@@ -221,7 +224,15 @@ class Speaker:
         The microphone ignores this time so Jarvis never hears (and wakes on) its own voice."""
         if not self.enabled:
             return False
-        return self._q.unfinished_tasks > 0 or time.monotonic() - self._last_end < tail_s
+        busy = self._q.unfinished_tasks > 0
+        if busy and self.stuck():
+            return False                                 # hung engine/device: don't keep the mic deaf
+        return busy or time.monotonic() - self._last_end < tail_s
+
+    def stuck(self, max_s: float = SPEAK_MAX_S) -> bool:
+        """One sentence playing for longer than max_s = the audio device / engine hung."""
+        st = getattr(self, "_started", 0.0)
+        return bool(st) and time.monotonic() - st > max_s
 
     def wait(self, timeout: Optional[float] = None) -> None:
         if self.enabled:
@@ -253,6 +264,7 @@ class Speaker:
                     return
                 _, voice, vol = item
                 self._interrupt.clear()
+                self._started = time.monotonic()
                 if isinstance(self.engine, PiperTTS):
                     audio, rate = self.engine.synthesize(text, voice)
                     if vol != 1.0:
@@ -273,9 +285,14 @@ class Speaker:
                 log.error("Ошибка TTS: %s", e)
             finally:
                 self._last_end = time.monotonic()
-                if text is not None and self._q.unfinished_tasks <= 1:
-                    self.on_event("speech_end")
-                self._q.task_done()
+                self._started = 0.0
+                try:
+                    if text is not None and self._q.unfinished_tasks <= 1:
+                        self.on_event("speech_end")
+                except Exception as e:                   # a GUI callback must never leave the queue "busy"
+                    log.exception("speech_end: %s", e)
+                finally:
+                    self._q.task_done()                  # else active() stays True forever and the mic goes deaf
 
 
 def synth_to_wav(cfg: dict, text: str, out_path: str | Path) -> Path:

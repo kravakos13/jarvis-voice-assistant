@@ -201,7 +201,9 @@ def test_settings_switch_placement_live():
 
 # ---------------------------------------------------------------- Ollama server env, Whisper, config
 def test_ollama_server_env_saves_vram_but_user_vars_win(monkeypatch):
+    from jarvis import cuda_libs
     from jarvis import ollama_setup as osu
+    monkeypatch.setattr(cuda_libs, "nvidia_gpu_present", lambda *a, **k: True)
     monkeypatch.delenv("OLLAMA_FLASH_ATTENTION", raising=False)
     monkeypatch.setenv("OLLAMA_KV_CACHE_TYPE", "f16")
     env = osu._serve_env("http://localhost:11434")
@@ -210,7 +212,9 @@ def test_ollama_server_env_saves_vram_but_user_vars_win(monkeypatch):
 
 
 def test_ollama_tray_app_also_gets_the_env(monkeypatch):
+    from jarvis import cuda_libs
     from jarvis import ollama_setup as osu
+    monkeypatch.setattr(cuda_libs, "nvidia_gpu_present", lambda *a, **k: True)
     seen = []
     state = {"up": False}
     monkeypatch.setattr(osu, "is_running", lambda host, session=None: state["up"])
@@ -363,3 +367,15 @@ def test_thread_safety_of_trace():
     [t.start() for t in ths]
     [t.join() for t in ths]
     assert "first_audio" in tr.marks
+
+
+def test_cpu_only_ollama_gets_no_quantized_kv(monkeypatch):
+    """1.0.7: garbage like «根据赛斯沃… onCreateViewHolder» — no q8 KV / flash attention without a GPU."""
+    from jarvis import cuda_libs
+    from jarvis import ollama_setup as osu
+    monkeypatch.delenv("OLLAMA_KV_CACHE_TYPE", raising=False)
+    monkeypatch.delenv("OLLAMA_FLASH_ATTENTION", raising=False)
+    monkeypatch.setattr(cuda_libs, "nvidia_gpu_present", lambda *a, **k: False)
+    env = osu._serve_env("http://localhost:11434")
+    assert "OLLAMA_KV_CACHE_TYPE" not in env and "OLLAMA_FLASH_ATTENTION" not in env
+    assert env["OLLAMA_NUM_PARALLEL"] == "1"

@@ -27,6 +27,11 @@ class FakeBackend(wn.Backend):
     def foreground(self):
         return self.fg
 
+    def activate(self, hwnd):
+        self.activated = getattr(self, "activated", []) + [hwnd]
+        self.fg = hwnd
+        return hwnd in self.wins
+
     def alive(self, hwnd):
         return hwnd in self.wins
 
@@ -110,7 +115,9 @@ def test_close_youtube_pwa_by_title(phrase):
 
 @pytest.mark.parametrize("phrase", ["выруби музыку", "закрой ютуб музыку", "выключи музыку", "закрой музон",
                                     "закрой youtube music"])
-def test_close_youtube_music(phrase):
+def test_close_youtube_music(phrase, monkeypatch):
+    from jarvis import uia
+    monkeypatch.setattr(uia, "media_playing", lambda: False)   # idle: «выключи музыку» closes the app (1.0.4)
     sk, b = make()
     r = sk.match(phrase, phrase)
     assert r is not None and r.reply == "Закрыл ютуб музыку." and b.closed == [3], (phrase, r and r.reply)
@@ -266,3 +273,27 @@ def test_own_pids_keep_launched_apps_closable(monkeypatch):
     monkeypatch.setattr(psutil, "Process", lambda *a: Me())
     pids = wn._own_pids()
     assert {10, 20} <= pids and not ({11, 21, 22} & pids)
+
+
+# ---------------------------------------------------------------- 1.0.7: user log 2026-10-18 routing misses
+def test_log_phrases_parse_wake_without_comma_and_hit_fast_path():
+    from jarvis.router import normalize
+    from jarvis.wake import WakeWordDetector
+    wd = WakeWordDetector.from_name("Джарвис", [])
+    for said, expect in (("Джарвис Сюрни Хром.", "minimize"), ("Джарвис, переключись на хром.", "switch"),
+                         ("Джарвис сверни хром", "minimize"), ("Джарвис, разверни хром.", "maximize")):
+        r = wd.detect(said)
+        assert r.detected and r.command, said
+        sk, b = make([W(1, "Джарвис", JARVIS_PID, "pythonw.exe"), W(4, "Новая вкладка - Google Chrome", 202, "chrome.exe")])
+        t = normalize(r.command)
+        res = sk.match(r.command, t)
+        assert res is not None, said
+        if expect == "switch":
+            assert res.reply == "Переключился на Chrome." and b.activated == [4], res.reply
+        else:
+            assert res.reply.startswith("Свернул" if expect == "minimize" else "Развернул"), res.reply
+
+
+def test_switch_to_not_open_app_is_left_to_apps():
+    sk, b = make([W(1, "Джарвис", JARVIS_PID, "pythonw.exe")])
+    assert sk.match("переключись на телеграм", "переключись на телеграм") is None

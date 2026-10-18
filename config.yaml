@@ -31,7 +31,8 @@ stt:                         # распознавание речи faster-whispe
   language: "ru"
   beam_size: 1
   download_root: "models/whisper"
-  initial_prompt: "Джарвис, привет. Джарвис, включи музыку."   # подсказка Whisper, чтобы имя распознавалось
+  initial_prompt: ""         # подсказка Whisper; пусто: имя передаётся как hotword (фразы-подсказки Whisper «слышал» в шуме)
+  vad_filter: true           # Silero VAD перед распознаванием: тишина и шум не превращаются в «привет»/«спасибо»
 
 audio:
   input_device: null         # null = по умолчанию; номер или часть названия (см. run.bat --list-devices)
@@ -46,7 +47,7 @@ audio:
 llm:
   host: "http://localhost:11434"
   model: "qwen2.5:7b"        # основная модель Ollama (хорошо знает русский, ~4.7 ГБ)
-  temperature: 0.6           # выше 0.7 qwen2.5 иногда «уплывает» в китайский
+  temperature: 0.5           # выше 0.6 qwen2.5 иногда «уплывает» в китайский
   top_p: 0.9
   top_k: 40
   repeat_penalty: 1.1
@@ -207,6 +208,12 @@ cad:                         # 3D-модели
   timeout_s: 180
 
 windows:                     # «закрой ютуб / окно / это», «сверни», «разверни» — по заголовку окна, с проверкой
+  enabled: true
+
+explorer:                    # проводник: «открой второй файл / третью папку / второе», «назад», «вверх»
+  enabled: true
+
+hotkeys:                     # голосовые горячие клавиши из jarvis/commands.yaml (+ %LOCALAPPDATA%\Jarvis\commands.yaml)
   enabled: true
 
 smarthome:

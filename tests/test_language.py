@@ -54,7 +54,7 @@ def test_system_prompt_always_ends_with_russian_rule_and_sane_options():
     p = s.payloads[0]
     assert p["messages"][0]["role"] == "system" and p["messages"][0]["content"].endswith(L.RU_RULE)
     o = p["options"]
-    assert o["temperature"] == 0.6 and o["top_p"] == 0.9 and o["top_k"] == 40 and o["repeat_penalty"] == 1.1
+    assert o["temperature"] == 0.5 and o["top_p"] == 0.9 and o["top_k"] == 40 and o["repeat_penalty"] == 1.1
     assert o["num_ctx"] == 6144 and o["num_predict"] == 512 and "num_gpu" not in o
 
 

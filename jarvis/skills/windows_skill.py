@@ -18,9 +18,12 @@ log = logging.getLogger(__name__)
 
 CLOSE_V = (r"закрой|закрои|закрою|закройте|закрывай|закрыть|закрой ка|выруби|вырубай|вырубить|вырубите|выключи|"
            r"выключай|убей|прибей|грохни|убери")
-MIN_V = r"сверни|свернуть|сверни ка|сверните|спрячь|скрой"
-MAX_V = r"разверни|развернуть|разверни ка|раскрой|открой на весь экран"
-VERB_RE = re.compile(rf"^(?:(?:ну|давай|джарвис|эй|слушай|а|пожалуйста)\s+)*({CLOSE_V}|{MIN_V}|{MAX_V})\b\s*(.*)$")
+MIN_V = (r"сверни|свернуть|сверни ка|сверните|спрячь|скрой|"
+         r"сюрни|свирни|сверне|зверни|сверли|свёрни|сварни|сверний|сверну")      # Whisper typos (user log: «Сюрни Хром»)
+MAX_V = r"разверни|развернуть|разверни ка|раскрой|открой на весь экран|разверне|розверни|развирни"
+ACT_V = (r"переключись на|переключи на|переключиться на|перейди в|перейди на|перейди к|вернись в|вернись к|"
+         r"покажи окно|активируй|сделай активным|давай в|открой окно")
+VERB_RE = re.compile(rf"^(?:(?:ну|давай|джарвис|эй|слушай|а|пожалуйста)\s+)*({ACT_V}|{CLOSE_V}|{MIN_V}|{MAX_V})\b\s*(.*)$")
 FILLERS = {
     "ну", "давай", "пожалуйста", "плиз", "быстро", "срочно", "уже", "мне", "ка", "там", "тут", "вот", "же", "то",
     "нахуй", "нахер", "нахрен", "нафиг", "нафик", "наху", "хуй", "хер", "хрен", "фиг", "нах", "на", "к", "черту",
@@ -143,6 +146,19 @@ class WindowsSkill(Skill):
         verb = {"minimize": "Свернул", "maximize": "Развернул", "restore": "Вернул"}[cmd]
         return ToolResult(f"{verb} {label}." if ok else f"Не получилось: окно {label} не поддаётся.")
 
+    def switch(self, name: str) -> Optional[ToolResult]:
+        """«переключись на хром»: bring an open window to the front (restore if minimized). Not open -> None,
+        so «перейди в телеграм» can still be handled by the apps skill (launch)."""
+        if self.wm.b is None:
+            return ToolResult("Управлять окнами я умею только в Windows.")
+        wins, label, _ = self._windows_for(name)
+        if not wins:
+            return None
+        w = wins[0]
+        self.wm.show(w, "restore")
+        ok = self.wm.b.activate(w.hwnd)
+        return ToolResult(f"Переключился на {label}." if ok else f"Не получилось переключиться на {label}.")
+
     # ------------------------------------------------------------ voice
     def match(self, text: str, t: str) -> Optional[ToolResult]:
         t = t.replace("закрой-ка", "закрой ка")
@@ -152,6 +168,13 @@ class WindowsSkill(Skill):
         verb, rest = m.group(1), m.group(2).strip()
         if NOT_WINDOWS.match(rest):
             return None                                  # «выключи звук/компьютер/свет» — other skills
+        if verb.startswith(("выключ", "выруб")) and re.match(
+                r"^(эт\w* )?(музык\w*|видео|видос\w*|ролик\w*|песн\w*|трек\w*|воспроизведени\w*)$", rest):
+            from .. import uia
+            if uia.media_playing():                      # sound is playing -> pause it (media skill), reversible;
+                return None                              # idle / unknown -> 1.0.4 behaviour: close the YT Music app
+        if re.fullmatch(ACT_V, verb):
+            return self.switch(_target_words(rest)) if rest else None
         is_min, is_max = bool(re.match(MIN_V, verb)), bool(re.match(MAX_V, verb))
         if is_max and re.match(r"^(все|всё)\b", rest):
             return None

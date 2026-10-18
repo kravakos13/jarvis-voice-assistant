@@ -27,6 +27,8 @@ SKILLS = [
     ("timers", "timers_skill", "TimersSkill"),
     ("weather", "weather_skill", "WeatherSkill"),
     ("system", "system_skill", "SystemSkill"),
+    ("explorer", "explorer_skill", "ExplorerSkill"),     # before smarthome/media: «открой второе» by context
+    ("hotkeys", "hotkeys_skill", "HotkeysSkill"),        # data-driven: jarvis/commands.yaml (+ user file)
     ("smarthome", "smarthome_skill", "SmartHomeSkill"),
     ("windows", "windows_skill", "WindowsSkill"),
     ("telegram", "telegram_skill", "TelegramSkill"),
@@ -104,6 +106,8 @@ class Router:
             ctx.extra["web"] = self.by_name["web"].web
         if "screen" in self.by_name:
             ctx.extra["screen"] = self.by_name["screen"].reader
+        if "windows" in self.by_name:
+            ctx.extra["wm"] = self.by_name["windows"].wm
         if "apps" in self.by_name:
             ctx.extra["launcher"] = self.by_name["apps"].launcher
         log.info("Модули: %s", ", ".join(s.name for s in self.skills))
@@ -120,6 +124,12 @@ class Router:
         if self.pending_confirm or self.pending_expect:
             return True
         return any(getattr(s, "awaiting", False) for s in self.skills)
+
+    @property
+    def awaiting_timeout(self) -> Optional[float]:
+        vals: list[float] = [float(v) for s in self.skills if getattr(s, "awaiting", False)
+                             if (v := getattr(s, "awaiting_timeout", None))]
+        return min(vals) if vals else None
 
     def stt_language(self):
         """Whisper language for the next phrase: 'default' (config) or None (auto) for the translator."""

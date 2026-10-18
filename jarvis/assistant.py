@@ -9,6 +9,7 @@ The GUI only receives events (thread-safe via Qt signals) and never blocks.
 from __future__ import annotations
 
 import datetime as _dt
+import difflib
 import logging
 import queue
 import re
@@ -19,7 +20,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 
 from .config import PROJECT_ROOT
-from .llm import LLMError, OllamaChat, SentenceSplitter, has_cjk, not_russian, strip_cjk, strip_note
+from .llm import FALLBACK_RU, LLMError, OllamaChat, SentenceSplitter, has_cjk, not_russian, strip_cjk, strip_note
 from .router import Router
 from .skills.base import SkillContext, ToolResult
 from .wake import WakeWordDetector
@@ -78,6 +79,7 @@ class Assistant:
         self.name = a.get("name", "Джарвис")
         self.mode = a.get("mode", "wake")
         self.mic_muted = False
+        self._said = []                                   # (text, time) of what Jarvis said: echo rejection
         self.wake = WakeWordDetector.from_name(self.name, a.get("extra_wake_words") or [])
         log.debug("Варианты имени: %s", self.wake.wake_words)
 
@@ -166,6 +168,10 @@ class Assistant:
 
     # ------------------------------------------------------------------ events / output
     def emit(self, event: str, **data) -> None:
+        if event == "state":
+            st = data.get("state", "")
+            if getattr(self, "_vstate", ("",))[0] != st:
+                self._vstate = (st, time.monotonic())
         try:
             self.on_event(event, **data)
         except Exception as e:
@@ -173,6 +179,8 @@ class Assistant:
 
     def _on_tts(self, event: str, **data) -> None:
         if event == "speech_start":
+            self._said.append((str(data.get("text") or ""), time.monotonic()))
+            del self._said[:-5]
             tr = getattr(self, "_trace", None)
             if tr is not None:
                 if self._ack_text and data.get("text") == self._ack_text:
@@ -322,7 +330,7 @@ class Assistant:
         mic = getattr(self, "_mic", None)
         try:
             if mic is not None:
-                mic.stop() if muted else (mic.start(), mic.clear())
+                (mic.pause() if hasattr(mic, "pause") else mic.stop()) if muted else (mic.start(), mic.clear())
         except Exception as e:
             log.error("Микрофон: %s", e)
         if cue:
@@ -430,7 +438,31 @@ class Assistant:
             log.exception("Распознавание не удалось: %s", e)
             text = ""
         self._stt_last = (t0, time.monotonic() - t0)
+        if text and self._is_echo(text):
+            log.debug("STT отброшено (это моя собственная фраза): %r", text)
+            return ""
         return text
+
+    _said: list = []
+
+    def _is_echo(self, heard: str, window_s: float = 20.0) -> bool:
+        """The mic caught Jarvis's own voice (speakers, room echo after the mute tail)."""
+        from .stt import _plain
+        h = _plain(heard)
+        if not h:
+            return False
+        now = time.monotonic()
+        for text, at in self._said:
+            if now - at > window_s:
+                continue
+            said = _plain(text)
+            if not said:
+                continue
+            if h == said or (len(h.split()) >= 2 and h in said):
+                return True
+            if difflib.SequenceMatcher(None, h, said).ratio() >= 0.8:
+                return True
+        return False
 
     def _voice_trace(self, command: str) -> Trace:
         if self._stt_last:
@@ -590,7 +622,11 @@ class Assistant:
                 log.warning("LLM: ответ уходит не на русский язык — переспрашиваю по-русски")
                 calls.clear()
                 held.clear()
-                fixed = strip_cjk(self.llm.regenerate_russian())
+                try:
+                    fixed = strip_cjk(self.llm.regenerate_russian())
+                except Exception as e:                 # noqa: BLE001 — never hang/die here (1.0.6 «falls asleep»)
+                    log.exception("LLM: повтор по-русски упал: %s", e)
+                    fixed = FALLBACK_RU
                 if spoken and fixed.startswith(" ".join(spoken)[:20]):
                     fixed = fixed[len(" ".join(spoken)):].strip()
                 if fixed:
@@ -604,7 +640,9 @@ class Assistant:
             print()
             log.error("%s", e)
             msg = str(e).lower()
-            if "repeat" in msg or "aborted" in msg:
+            if "timeout" in msg or "timed out" in msg:
+                self.say("Слишком долго думаю. Повтори, пожалуйста, покороче.")
+            elif "repeat" in msg or "aborted" in msg:
                 self.say("Что-то я зациклился. Спроси ещё раз, пожалуйста, по-другому.")
             elif "not found" in msg and "model" in msg:
                 self.say(f"Модель {self.llm.model} не скачана. Открой Настройки, вкладка ИИ, и нажми «Скачать модель».")
@@ -676,6 +714,10 @@ class Assistant:
         k = 0
         tail = float(self.cfg["assistant"].get("tts_tail_ms", 500) or 0) / 1000.0
         for frame in mic.frames(self.stop_event):
+            self._hb = time.monotonic()
+            rl = getattr(self, "_relisten", None)
+            if rl is not None and rl.is_set():
+                return
             if self.mic_muted:
                 continue
             if self.speaker is not None and self.speaker.active(tail):
@@ -705,7 +747,8 @@ class Assistant:
     def _execute_voice(self, mic, command: str) -> None:
         print(f"Ты: {command}")
         self.submit(command, "voice", self._voice_trace(command))
-        self.wait_idle()
+        if not self.wait_idle(self.STUCK_S * 2):
+            log.warning("Команда «%s» выполняется > %.0f с — продолжаю слушать", command[:60], self.STUCK_S * 2)
         mic.clear()
 
     def ptt_press(self) -> None:
@@ -728,22 +771,103 @@ class Assistant:
             execute=lambda command: self._execute_voice(mic, command),
             emit=lambda st: self.emit("state", state="muted" if self.mic_muted else st),
             awaiting=lambda: bool(self.router.awaiting_input),
+            awaiting_timeout=lambda: self.router.awaiting_timeout,
             cfg=self.cfg["assistant"],
             follow_allowed=lambda: self.profile != "game")
 
+    # ---------------------------------------------------------------- voice loop supervision (1.0.7)
+    STUCK_S = 60.0          # listening / thinking / speaking longer than this = stuck -> reset
+    DEAF_S = 15.0           # no mic frames consumed while waiting for the wake word -> restart the stream
+
     def run_voice(self) -> None:
+        """Supervisor: the listening session is re-opened after ANY error or a restart request, so one bad phrase,
+        a vanished microphone or a stuck state can never leave Jarvis deaf until the app is restarted."""
+        self._relisten = threading.Event()
+        self._voice_alive = True
+        self._hb = time.monotonic()
+        if not getattr(self, "_watchdog_started", False):
+            self._watchdog_started = True
+            threading.Thread(target=self._watchdog, name="jarvis-voice-watchdog", daemon=True).start()
+        greet = True
+        try:
+            while not self.stop_event.is_set():
+                self._relisten.clear()
+                try:
+                    self._voice_session(greet)
+                except Exception as e:                    # noqa: BLE001 — full traceback to jarvis.log
+                    log.exception("Голосовая сессия упала: %s — перезапускаю прослушку", e)
+                    self.stop_event.wait(2.0)
+                finally:
+                    greet = False
+                    self._reset_voice_state()
+                if self._relisten.is_set():
+                    log.warning("Прослушка перезапущена")
+        finally:
+            self._voice_alive = False
+
+    def _reset_voice_state(self) -> None:
+        try:
+            self._ptt_active.clear()
+            self.emit("state", state="muted" if self.mic_muted else ("sleeping" if self.mode == "wake" else "idle"))
+        except Exception as e:                            # noqa: BLE001
+            log.debug("reset state: %s", e)
+
+    def restart_listening(self, reason: str = "по запросу") -> bool:
+        """Tray «Перезапустить прослушку» / watchdog. Returns False if the voice loop is not running at all."""
+        log.warning("Перезапуск прослушки: %s", reason)
+        sp = self.speaker
+        if sp is not None and (getattr(sp, "stuck", lambda: False)() or reason == "по запросу"):
+            try:
+                sp.interrupt()
+            except Exception as e:                        # noqa: BLE001
+                log.debug("interrupt: %s", e)
+        ev = getattr(self, "_relisten", None)
+        if ev is not None:
+            ev.set()
+        return bool(getattr(self, "_voice_alive", False))
+
+    def _watchdog(self) -> None:
+        while not self.stop_event.wait(2.0):
+            try:
+                self._watch_once(time.monotonic())
+            except Exception as e:                        # noqa: BLE001
+                log.exception("watchdog: %s", e)
+
+    def _watch_once(self, now: float) -> Optional[str]:
+        """One watchdog check; returns what it did (tests)."""
+        if not getattr(self, "_voice_alive", False) or self.mic_muted:
+            return None
+        sp = self.speaker
+        if sp is not None and getattr(sp, "stuck", lambda: False)():
+            log.warning("Речь зависла (> %.0f с) — сбрасываю", self.STUCK_S)
+            sp.interrupt()
+            return "tts"
+        st, since = getattr(self, "_vstate", ("", now))
+        if st in ("listening", "thinking", "speaking") and now - since > self.STUCK_S:
+            log.warning("Состояние «%s» держится %.0f с — сбрасываю прослушку", st, now - since)
+            self._vstate = ("", now)
+            self.restart_listening(f"завис в состоянии {st}")
+            return "stuck"
+        if st in ("sleeping", "idle", "") and self.mode == "wake" and now - getattr(self, "_hb", now) > self.DEAF_S:
+            self._hb = now
+            self.restart_listening("нет кадров с микрофона")
+            return "deaf"
+        return None
+
+    def _voice_session(self, greet: bool) -> None:
         """Wake word / push-to-talk loop (mode can be switched at runtime)."""
         from .audio import make_vad
         vad = make_vad(self.cfg["audio"])
         with self._new_mic() as mic:
             self._mic = mic
             if self.mic_muted:
-                mic.stop()
-            self.greet()
+                mic.pause() if hasattr(mic, "pause") else mic.stop()
+            if greet:
+                self.greet()
             mic.clear()
             flow = self._wake_flow(mic, vad)
             print(f"Сплю. Скажи «{self.name}» (или «{self.name}, <команда>»). Ctrl+C - выход.")
-            while not self.stop_event.is_set():
+            while not self.stop_event.is_set() and not self._relisten.is_set():
                 self.emit("state", state="muted" if self.mic_muted else ("sleeping" if self.mode == "wake" else "idle"))
                 if self.mode == "ptt":
                     if not self._ptt_active.wait(0.2):
@@ -771,6 +895,8 @@ class Assistant:
                 except Exception as e:                    # keep listening: one bad step must not drop to text mode
                     log.exception("Голосовой цикл: %s", e)
                     self.stop_event.wait(0.5)
+                finally:
+                    flow.state = ""                       # next step always starts from «waiting for the name»
 
     def run_wav(self, path: str) -> None:
         from .audio import read_wav
