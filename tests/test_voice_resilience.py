@@ -127,8 +127,12 @@ def test_watchdog_resets_stuck_tts_state_and_deaf_mic():
     a._voice_alive, a._relisten, a._hb = True, threading.Event(), 100.0
     a.speaker = StuckSpeaker()
     assert a._watch_once(101.0) == "tts" and a.speaker.interrupted == 1
-    a._vstate = ("thinking", 100.0)
+    a._vstate = ("speaking", 100.0)
     assert a._watch_once(100.0 + 61) == "stuck" and a._relisten.is_set()
+    a._relisten.clear()
+    a._vstate = ("thinking", 100.0)                     # 1.0.8: an LLM turn (90 s) + one retry is not «stuck»
+    assert a._watch_once(100.0 + 61) is None
+    assert a._watch_once(100.0 + a._stuck_limit("thinking") + 1) == "stuck" and a._relisten.is_set()
     a._relisten.clear()
     a._vstate, a._hb = ("sleeping", 200.0), 200.0
     assert a._watch_once(210.0) is None

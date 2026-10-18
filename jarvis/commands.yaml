@@ -48,20 +48,6 @@
   action: tab_n
   reply: ""
   example: вторая вкладка
-- id: back
-  section: Браузер
-  scope: browser
-  phrases: ["назад", "вернись назад", "на страницу назад", "страница назад"]
-  keys: alt+left
-  reply: ""
-  example: назад
-- id: forward
-  section: Браузер
-  scope: browser
-  phrases: ["вперед", "страница вперед", "на страницу вперед"]
-  keys: alt+right
-  reply: ""
-  example: вперёд
 - id: reload
   section: Браузер
   scope: browser

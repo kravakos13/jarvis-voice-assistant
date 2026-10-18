@@ -82,7 +82,7 @@ def test_default_prompt_has_no_greeting_and_old_one_is_migrated():
         d, _ = C.migrate_local({"config_version": 6, "stt": {"initial_prompt": old}})
         assert "initial_prompt" not in d["stt"], old
     d, ch = C.migrate_local({"config_version": 6, "stt": {"initial_prompt": C.OLD_PROMPT, "device": "cpu"}})
-    assert ch and d["stt"] == {"device": "cpu"} and d["config_version"] == 7
+    assert ch and d["stt"] == {"device": "cpu"} and d["config_version"] == C.CONFIG_VERSION
     d, _ = C.migrate_local({"config_version": 6, "stt": {"initial_prompt": "Моя подсказка"}})
     assert d["stt"]["initial_prompt"] == "Моя подсказка"          # user's own prompt untouched
 

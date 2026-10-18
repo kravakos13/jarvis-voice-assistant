@@ -170,35 +170,101 @@ def _spawn_hidden(argv: list, env: Optional[dict] = None) -> subprocess.Popen:
                             stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags, env=env)
 
 
-SERVER_ENV = {"OLLAMA_FLASH_ATTENTION": "1",   # less VRAM for attention; needed for the q8 KV cache
-              "OLLAMA_KV_CACHE_TYPE": "q8_0",   # KV cache at half size, quality loss is negligible
+# 1.0.8: flash attention + q8_0 KV cache are OFF by default. On GTX 16xx/10xx (Turing TU116/TU117 and Pascal: no
+# tensor cores) and on CPU they made qwen2.5 answer with garbage («榜东庚洙和合zano:SqlCommand», users' logs).
+# Opt-in for RTX cards: settings ollama.fast_kv: true.
+SERVER_ENV = {"OLLAMA_FLASH_ATTENTION": "0",
+              "OLLAMA_KV_CACHE_TYPE": "f16",
               "OLLAMA_NUM_PARALLEL": "1"}       # one conversation -> one KV cache (parallel slots multiply VRAM)
+# (no OLLAMA_MAX_LOADED_MODELS=1: the 0.3 GB CPU embedding model would evict the main model on every memory lookup)
+FAST_KV_ENV = {"OLLAMA_FLASH_ATTENTION": "1", "OLLAMA_KV_CACHE_TYPE": "q8_0"}
+SAFE_KEYS = ("OLLAMA_FLASH_ATTENTION", "OLLAMA_KV_CACHE_TYPE")
 
 
-def _serve_env(host: str, extra: Optional[dict] = None) -> dict:
-    """Environment for an Ollama started by Jarvis. The user's own OLLAMA_* variables always win."""
+def server_env_for(oc: dict) -> dict:
+    env = dict(SERVER_ENV)
+    if oc.get("fast_kv"):
+        try:
+            from .cuda_libs import nvidia_gpu_present
+            gpu = nvidia_gpu_present()
+        except Exception:                                # noqa: BLE001
+            gpu = False
+        if gpu:                                          # never on CPU
+            env.update(FAST_KV_ENV)
+    extra = dict(oc.get("server_env") or {})
+    if not oc.get("fast_kv"):
+        for k in SAFE_KEYS:                              # 1.0.7 config.yaml shipped FA=1/q8_0 here -> ignored
+            extra.pop(k, None)
+    env.update(extra)
+    return env
+
+
+def _serve_env(host: str, extra: Optional[dict] = None, force_safe: bool = False) -> dict:
+    """Environment for an Ollama started by Jarvis. The user's own OLLAMA_* variables win, except after the garbage
+    self-test failed (force_safe): then FA/KV are forced to the safe values."""
     env = dict(os.environ)
     wanted = dict(SERVER_ENV if extra is None else extra)
-    try:
-        from .cuda_libs import nvidia_gpu_present
-        gpu = nvidia_gpu_present()
-    except Exception:                                    # noqa: BLE001
-        gpu = True
-    if not gpu:
-        # CPU-only: q8 KV cache + flash attention save VRAM there is none of, and on some CPU builds they degrade
-        # qwen2.5 output (garbage like «根据赛斯沃… onCreateViewHolder» in users' logs) -> plain f16 KV on CPU.
-        for k in ("OLLAMA_KV_CACHE_TYPE", "OLLAMA_FLASH_ATTENTION"):
-            wanted.pop(k, None)
     for k, v in wanted.items():
         if v is not None and str(v) != "" and k not in os.environ:
             env[str(k)] = str(v)
+    if force_safe:
+        env.update({k: SERVER_ENV[k] for k in SAFE_KEYS})
     port = urllib.parse.urlparse(host).port
     if port and port != 11434:
         env["OLLAMA_HOST"] = f"127.0.0.1:{port}"
     return env
 
 
-def start(cfg: dict, wait: float = 30.0, session=requests, popen=_spawn_hidden, sleep=time.sleep,
+def _spawn_low(argv: list, env: Optional[dict] = None) -> subprocess.Popen:
+    """Hidden + BELOW_NORMAL priority (1.0.8: a CPU-spilled prompt eval must not starve Windows)."""
+    flags = 0
+    if IS_WIN:
+        flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                 | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x4000))
+    return subprocess.Popen([str(a) for a in argv], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags, env=env)
+
+
+def stop_all(run=subprocess.run) -> None:
+    """Stop the Ollama tray app and server (for a restart with safe settings)."""
+    if IS_WIN:
+        for name in (APP_NAME, "ollama.exe"):
+            try:
+                run(["taskkill", "/IM", name, "/F"], capture_output=True, timeout=10,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception as e:                       # noqa: BLE001
+                log.debug("taskkill %s: %s", name, e)
+    else:
+        try:
+            run(["pkill", "-f", "ollama serve"], capture_output=True, timeout=10)
+        except Exception as e:                           # noqa: BLE001
+            log.debug("pkill: %s", e)
+
+
+def restart_safe(cfg: dict, session=requests, sleep=time.sleep) -> bool:
+    """Garbage self-test failed: restart Ollama with flash attention off and f16 KV cache (forced)."""
+    log.warning("Ollama: перезапускаю с безопасными настройками (FLASH_ATTENTION=0, KV f16)")
+    stop_all()
+    sleep(2.0)
+    exe = find_exe()
+    if not exe:
+        return False
+    host = host_of(cfg)
+    oc = cfg.get("ollama") or {}
+    env = _serve_env(host, server_env_for({**oc, "fast_kv": False}), force_safe=True)
+    try:
+        _spawn_low([exe, "serve"], env=env)               # the bare server: the tray app might re-read user env
+    except OSError as e:
+        log.warning("ollama serve не запустился: %s", e)
+        return False
+    for _ in range(30):
+        if is_running(host, session):
+            return True
+        sleep(1.0)
+    return False
+
+
+def start(cfg: dict, wait: float = 30.0, session=requests, popen=_spawn_low, sleep=time.sleep,
           clock=time.monotonic, find: Optional[Callable[[], Optional[Path]]] = None,
           procs: Optional[Callable[[], list]] = None, progress: Optional[Progress] = None) -> bool:
     """Make sure the local Ollama server answers. Returns True when it does (within `wait` seconds)."""
@@ -230,14 +296,14 @@ def start(cfg: dict, wait: float = 30.0, session=requests, popen=_spawn_hidden, 
     app = find_app(exe) if oc.get("start_tray_app", True) else None
     if app:
         try:
-            popen([app], env=_serve_env(host, oc.get("server_env")))
+            popen([app], env=_serve_env(host, server_env_for(oc)))
             log.info("Запущено приложение Ollama: %s", app)
             if wait_until(min(end, clock() + 12)):
                 return True
         except OSError as e:
             log.warning("Приложение Ollama не запустилось: %s", e)
     try:
-        popen([exe, "serve"], env=_serve_env(host, oc.get("server_env")))
+        popen([exe, "serve"], env=_serve_env(host, server_env_for(oc)))
         log.info("Запущен скрытый сервер: %s serve", exe)
     except OSError as e:
         log.warning("ollama serve не запустился: %s", e)

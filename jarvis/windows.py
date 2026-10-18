@@ -206,13 +206,37 @@ class Win32Backend(Backend):
         return True
 
     def activate(self, hwnd: int) -> bool:
-        u = self.u
+        """Bring a window to the front despite the foreground lock: attach our input queue to the current
+        foreground thread and the target's thread (AttachThreadInput), then SetForegroundWindow/BringWindowToTop.
+        No Alt-tap trick: an injected Alt can open the target app's menu bar, and typed text would go there.
+        Last resort: minimize + restore (the restored window is activated by the system)."""
+        u, k, wt = self.u, self.k, self.wt
         if u.IsIconic(hwnd):
-            u.ShowWindow(hwnd, 9)
-        # Alt tap lifts the foreground lock for background processes (documented SetForegroundWindow rules)
-        u.keybd_event(0x12, 0, 0, 0)
-        u.keybd_event(0x12, 0, 2, 0)
-        return bool(u.SetForegroundWindow(hwnd))
+            u.ShowWindow(hwnd, 9)                        # SW_RESTORE
+        fg = int(u.GetForegroundWindow() or 0)
+        if fg == hwnd:
+            return True
+        cur = int(k.GetCurrentThreadId())
+        threads = set()
+        for h in (fg, hwnd):
+            if h:
+                threads.add(int(u.GetWindowThreadProcessId(wt.HWND(h), None)))
+        attached = []
+        try:
+            for t in threads - {cur, 0}:
+                if u.AttachThreadInput(cur, t, True):
+                    attached.append(t)
+            u.BringWindowToTop(hwnd)
+            u.SetForegroundWindow(hwnd)              # activation restores the app's own focused control
+        finally:
+            for t in attached:
+                u.AttachThreadInput(cur, t, False)
+        if int(u.GetForegroundWindow() or 0) == hwnd:
+            return True
+        u.ShowWindow(hwnd, 6)                            # SW_MINIMIZE
+        u.ShowWindow(hwnd, 9)                            # SW_RESTORE -> activated
+        u.SetForegroundWindow(hwnd)
+        return int(u.GetForegroundWindow() or 0) == hwnd
 
     def ctrl_w(self, hwnd: int) -> bool:
         if not self.activate(hwnd):
@@ -350,6 +374,7 @@ class WindowManager:
         self.own = set(own_pids if own_pids is not None else _own_pids())
         self.sleep, self.clock, self.verify_s = sleep, clock, verify_s
         self.last_fg: Optional[Window] = None        # last foreground window that is not Jarvis / shell
+        self.prev_fg: Optional[Window] = None        # the user's window before last_fg
 
     # ---- protection
     def protected(self, w: Window) -> bool:
@@ -380,8 +405,20 @@ class WindowManager:
         for w in self.b.windows():
             if w.hwnd == fg:
                 if not self.protected(w):
+                    if self.last_fg is not None and self.last_fg.hwnd != w.hwnd:
+                        self.prev_fg = self.last_fg          # «вернись» = the window before this one
                     self.last_fg = w
                 return
+
+    def previous(self) -> Optional[Window]:
+        """The user's window before the current one (still open, not Jarvis)."""
+        if self.prev_fg is None:
+            return None
+        cur = self.active()
+        for w in self.candidates():
+            if w.hwnd == self.prev_fg.hwnd and (cur is None or w.hwnd != cur.hwnd):
+                return w
+        return None
 
     def active(self) -> Optional[Window]:
         """Window meant by «закрой это/окно»: the foreground one unless it is Jarvis, else the previous one."""

@@ -55,7 +55,7 @@ def test_system_prompt_always_ends_with_russian_rule_and_sane_options():
     assert p["messages"][0]["role"] == "system" and p["messages"][0]["content"].endswith(L.RU_RULE)
     o = p["options"]
     assert o["temperature"] == 0.5 and o["top_p"] == 0.9 and o["top_k"] == 40 and o["repeat_penalty"] == 1.1
-    assert o["num_ctx"] == 6144 and o["num_predict"] == 512 and "num_gpu" not in o
+    assert o["num_ctx"] == 4096 and o["num_predict"] == 512 and "num_gpu" not in o     # 1.0.8 default
 
 
 def test_budget_keeps_system_prompt_and_trims_old_history():

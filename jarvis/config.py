@@ -29,16 +29,21 @@ DEFAULTS: dict[str, Any] = {
     "assistant": {"name": "Джарвис", "user_name": "Флоки", "mode": "wake", "wake_reply": "Слушаю",
                   "greeting": "{hello}, мистер {user_name}, чего желаете?", "greeting_time_of_day": False,
                   "greet_on_start": True, "follow_up_seconds": 0, "extra_wake_words": [],
+                  "conversation": {"enabled": True, "idle_s": 22},
+                  "noname": {"enabled": True, "groups": {g: True for g in (
+                      "media", "youtube", "nav", "browser", "windows", "explorer", "keys", "dictation", "apps",
+                      "music", "smarthome")}},
                   "request_timeout_s": 6, "request_silence_ms": 1200, "max_request_s": 15, "tts_tail_ms": 500,
                   "ack_after_s": 2.5},
     "stt": {"model": "small", "device": "cpu", "compute_type": "auto", "language": "ru", "beam_size": 1,
             "download_root": "models/whisper", "initial_prompt": "", "vad_filter": True},
     "audio": {"input_device": None, "output_device": None, "sample_rate": 16000, "vad": "webrtc",
-              "vad_aggressiveness": 2, "energy_threshold": 0.015, "frame_ms": 30, "silence_ms": 800,
+              "vad_aggressiveness": 2, "energy_threshold": 0.015, "frame_ms": 30, "silence_ms": 500,
               "min_speech_ms": 250, "max_utterance_s": 15, "pre_roll_ms": 300},
-    "llm": {"host": "http://localhost:11434", "model": "qwen2.5:7b", "temperature": 0.6, "num_ctx": 6144, "placement": "gpu",
+    "llm": {"host": "http://localhost:11434", "model": "qwen2.5:7b", "temperature": 0.6, "num_ctx": None, "placement": "gpu",
             "num_predict": 512, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.1,
-            "max_history_messages": 16, "timeout_s": 120, "keep_alive": "30m", "aux_keep_alive": "1m",
+            "max_history_messages": 16, "timeout_s": 120, "keep_alive": None, "aux_keep_alive": "1m",
+            "num_thread": None, "tools": None, "light_model": False,
             "tool_calling": True, "system_prompt": DEFAULT_SYSTEM_PROMPT},
     "tts": {"engine": "piper", "piper_voice": "ru_RU-denis-medium", "voices_dir": "voices", "length_scale": 1.1,
             "fx": {"enabled": True, "intensity": 0.35},
@@ -47,8 +52,12 @@ DEFAULTS: dict[str, Any] = {
     "windows": {"enabled": True},
     "explorer": {"enabled": True},
     "hotkeys": {"enabled": True},
+    "nav": {"enabled": True},
+    "chat": {"enabled": True},              # module switch; the user toggle is assistant.conversation.enabled
+    "keys": {"enabled": True},
     "gui": {"enabled": True, "always_on_top": False, "start_minimized": False, "close_to_tray": True,
-            "hotkey_show": "ctrl+alt+j", "hotkey_ptt": "ctrl+alt+space", "hotkey_game": "ctrl+alt+g", "fps": 30},
+            "hotkey_show": "ctrl+alt+j", "hotkey_ptt": "ctrl+alt+space", "hotkey_game": "ctrl+alt+g", "fps": None},
+    "load": {"preset": "balanced", "log_every_s": 300},
     "autostart": {"enabled": True},
     "logging": {"level": "INFO", "file": "logs/jarvis.log"},
 }
@@ -77,7 +86,7 @@ def _read_yaml(path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
-CONFIG_VERSION = 7
+CONFIG_VERSION = 8
 OLD_PROMPT = "Джарвис, привет. Джарвис, включи музыку."
 REMOVED_SECTIONS = ("whatsapp", "comfyui", "faceswap", "video")
 
@@ -142,7 +151,50 @@ def migrate_local(data) -> tuple[dict, bool]:
             stt.pop("initial_prompt")             # greeting-like prompts are echoed by Whisper as phantom input
         data["config_version"] = 7
         changed = True
+    if ver < 8:                                   # 1.0.8: «Нагрузка» presets; old defaults pinned by Settings -> preset
+        llm = data.get("llm")  # type: ignore[assignment]
+        if isinstance(llm, dict):
+            if str(llm.get("keep_alive", "")).strip() == "30m":
+                llm.pop("keep_alive")
+            if str(llm.get("num_ctx", "")).strip() in ("6144", "8192"):
+                llm.pop("num_ctx")
+        au = data.get("audio")
+        if isinstance(au, dict) and str(au.get("silence_ms", "")).strip() == "800":
+            au.pop("silence_ms")                   # old default pinned by Settings -> 500 ms (faster commands)
+        gui = data.get("gui")
+        if isinstance(gui, dict) and str(gui.get("fps", "")).strip() == "30":
+            gui.pop("fps")
+        oc = data.get("ollama")
+        if isinstance(oc, dict) and isinstance(oc.get("server_env"), dict):
+            for k in ("OLLAMA_FLASH_ATTENTION", "OLLAMA_KV_CACHE_TYPE"):
+                oc["server_env"].pop(k, None)      # garbage output on GTX 16xx (users' logs) -> safe defaults
+        data["config_version"] = 8
+        changed = True
     return data, changed
+
+
+def apply_load_preset(cfg: dict) -> dict:
+    """Fill the «Нагрузка» preset into keys the user did not set explicitly."""
+    from .resources import LIGHT_MODEL, preset
+    pr = preset(cfg)
+    llm, stt, gui = cfg.setdefault("llm", {}), cfg.setdefault("stt", {}), cfg.setdefault("gui", {})
+    if not llm.get("num_ctx"):
+        llm["num_ctx"] = pr["num_ctx"]
+    if not llm.get("keep_alive") and llm.get("keep_alive") != 0:
+        llm["keep_alive"] = pr["keep_alive"]
+    if llm.get("num_thread") in (None, ""):
+        llm["num_thread"] = pr["threads"]
+    if not llm.get("tools"):
+        llm["tools"] = pr["tools"]
+    if llm.get("light_model") or pr.get("model"):
+        llm["model"] = pr.get("model") or LIGHT_MODEL          # only by the user's explicit choice
+    if stt.get("cpu_threads") in (None, "", 0):
+        stt["cpu_threads"] = pr["threads"]
+    if not gui.get("fps"):
+        gui["fps"] = pr["face_fps"]
+    llm.setdefault("vram_headroom_gb", pr["vram_headroom_gb"])
+    llm.setdefault("min_free_ram_gb", pr["min_free_ram_gb"])
+    return cfg
 
 
 def raw_config(path: str | os.PathLike | None = None, use_local: bool = True) -> dict[str, Any]:
@@ -199,6 +251,7 @@ def load_config(path: str | os.PathLike | None = None, use_local: bool = True) -
     # Whisper echoed it on noise -> phantom «Джарвис, привет.» commands (seen in users' logs).
     if a.get("name") and not cfg["stt"].get("hotwords"):
         cfg["stt"]["hotwords"] = str(a["name"])
+    apply_load_preset(cfg)
     return cfg
 
 

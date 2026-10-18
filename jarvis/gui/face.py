@@ -66,7 +66,7 @@ class HologramFace(QWidget):
         self.base_fps = fps
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update)
-        self.timer.start(int(1000 / max(10, fps)))
+        self.timer.start(int(1000 / max(10, min(30, fps))))
 
     # ------------------------------------------------------------ API (call from GUI thread)
     def set_color(self, color) -> None:
@@ -81,11 +81,24 @@ class HologramFace(QWidget):
 
     def set_animation(self, level: str) -> None:
         """full / lite (weak PCs) / off (almost static)."""
-        fps = {"full": self.base_fps, "lite": 20, "off": 8}.get(level, self.base_fps)
+        fps = {"full": min(30, self.base_fps), "lite": 20, "off": 8}.get(level, min(30, self.base_fps))
         self.timer.setInterval(int(1000 / max(5, fps)))
+
+    def showEvent(self, e):  # noqa: N802 — 1.0.8: hidden window = no repaint timer
+        super().showEvent(e)
+        if not self.timer.isActive():
+            self.timer.start()
+
+    def hideEvent(self, e):  # noqa: N802
+        super().hideEvent(e)
+        self.timer.stop()
+
+    IDLE_FPS = 15                     # 1.0.8: sleeping = slow breathing only -> half the frames (idle CPU)
 
     def set_state(self, state: str) -> None:
         self.state = state
+        fps = min(self.IDLE_FPS, self.base_fps) if state in ("sleeping", "muted") else min(30, self.base_fps)
+        self.timer.setInterval(int(1000 / max(5, fps)))
 
     def set_mic_level(self, level: float) -> None:
         self.mic_level = max(0.0, min(1.0, level))

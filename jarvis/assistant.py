@@ -129,12 +129,16 @@ class Assistant:
         self._stt_last: Optional[tuple[float, float]] = None     # (start, seconds) of the last transcription
         self._ack_text = ""
         self.llm.warm_tools = self.router.tool_schemas() if self.tool_calling else None
+        self.router.ctx.extra["stt_conf"] = lambda: getattr(self.stt, "last_conf", None)
         if self.llm.placement == "cpu":
             self.llm.on_cpu = True
         # after Whisper took its VRAM: load the LLM and pre-evaluate system prompt + tools, so the first
         # command is not a cold start (several seconds on a 6 GB card)
         if self.llm_ok and cfg["llm"].get("warm_up", True):
-            threading.Thread(target=self.llm.warm, args=(self.llm.warm_tools,), name="llm-warm", daemon=True).start()
+            threading.Thread(target=self._warm_and_check, name="llm-warm", daemon=True).start()
+        from .resources import Monitor
+        self.monitor = Monitor(self.llm, float((cfg.get("load") or {}).get("log_every_s", 300) or 300))
+        threading.Thread(target=self.monitor.run, args=(self.stop_event,), name="jarvis-res", daemon=True).start()
 
         self._commands: "queue.Queue[tuple]" = queue.Queue()
         self._idle = threading.Event()
@@ -190,7 +194,13 @@ class Assistant:
             self.emit("state", state="speaking")
             self.emit("speech", **data)
         elif event == "speech_end":
+            self._tts_end_at = time.monotonic()
             self.emit("speech_end")
+            idle = getattr(self, "_idle", None)
+            sp = self.speaker
+            more = sp is not None and getattr(getattr(sp, "_q", None), "unfinished_tasks", 0) > 1
+            if idle is not None and not idle.is_set() and not more:
+                self.emit("state", state="thinking")          # LLM still generating: not «speaking» (watchdog label)
 
     def _notify(self, title: str, text: str) -> None:
         from .platform_utils import notify
@@ -504,6 +514,9 @@ class Assistant:
             self._trace = tr
             ack = self._start_ack(tr, source)
             try:
+                if source == "noname":
+                    self._respond_silent(text)
+                    continue
                 self.emit("user_text", text=text, source=source)
                 if self.respond(text) == "exit":
                     self.emit("exit")
@@ -521,9 +534,57 @@ class Assistant:
                     self.timings.finish(tr)
                 except Exception as e:
                     log.debug("timing: %s", e)
+                try:
+                    self.router.after_turn()          # conversation mode: silence is counted after the answer
+                except Exception as e:                # noqa: BLE001
+                    log.debug("after_turn: %s", e)
                 if self._commands.empty():
                     self.emit("state", state="idle")
                     self._idle.set()
+
+    def _respond_silent(self, text: str) -> None:
+        """No-name command: fast path only (never the LLM), no voice reply, never «exit»."""
+        r = self.router.handle(text)
+        if r is None:
+            log.debug("Без имени: никто не взял %r — молчу", text)
+            return
+        self.emit("user_text", text=text, source="noname")     # GUI shows it briefly
+        self.emit("noname", text=text)                          # face flash
+        if r.reply:
+            log.info("Без имени выполнено: %s → %s", text, r.reply)
+        if r.then:
+            def job():
+                try:
+                    extra = r.then()
+                    if isinstance(extra, ToolResult) and extra.then:
+                        extra.then()
+                except Exception as e:                           # noqa: BLE001
+                    log.exception("action: %s", e)
+            threading.Thread(target=job, daemon=True).start() if r.background else job()
+
+    def _warm_and_check(self) -> None:
+        """1.0.8: warm the model, then a tiny self-test. Garbage (CJK / no Cyrillic, seen on GTX 1660 Super with
+        flash attention + q8 KV) -> restart Ollama with safe settings and test again; still bad -> tell the user."""
+        from . import ollama_setup
+        if self.llm.warm(self.llm.warm_tools) is None:
+            return
+        if not (self.cfg.get("ollama") or {}).get("selftest", True):
+            return
+        if self.llm.selftest() != "garbage":
+            return
+        log.warning("ИИ отвечает мусором — перезапускаю Ollama без flash attention и с KV f16")
+        self.emit("notice", text="ИИ отвечал мусором — перезапускаю Ollama с безопасными настройками…")
+        if ollama_setup.is_local(ollama_setup.host_of(self.cfg)) and ollama_setup.restart_safe(self.cfg):
+            self.llm.warm(self.llm.warm_tools)
+            res = self.llm.selftest()
+            if res == "ok":
+                log.info("После перезапуска Ollama ИИ отвечает нормально")
+                self.emit("notice", text="ИИ снова в порядке.")
+                return
+        log.error("ИИ всё ещё отвечает мусором: попробуй «Нагрузка: Лёгкая» (qwen2.5:3b) или обнови Ollama и "
+                  "драйвер видеокарты")
+        self.emit("notice", text="ИИ отвечает мусором даже после перезапуска Ollama. Команды работают; для разговора "
+                                 "попробуй в настройках «Нагрузка: Лёгкая» или обнови Ollama и драйвер видеокарты.")
 
     def _run_result(self, r: ToolResult) -> Optional[str]:
         if r.action == "reset":
@@ -640,7 +701,11 @@ class Assistant:
             print()
             log.error("%s", e)
             msg = str(e).lower()
-            if "timeout" in msg or "timed out" in msg:
+            if msg.startswith("cancelled"):
+                return None                               # «Перезапустить прослушку» — silently
+            if msg.startswith("memory:"):
+                self.say(str(e).split(":", 1)[1].strip())
+            elif "timeout" in msg or "timed out" in msg:
                 self.say("Слишком долго думаю. Повтори, пожалуйста, покороче.")
             elif "repeat" in msg or "aborted" in msg:
                 self.say("Что-то я зациклился. Спроси ещё раз, пожалуйста, по-другому.")
@@ -773,11 +838,46 @@ class Assistant:
             awaiting=lambda: bool(self.router.awaiting_input),
             awaiting_timeout=lambda: self.router.awaiting_timeout,
             cfg=self.cfg["assistant"],
-            follow_allowed=lambda: self.profile != "game")
+            follow_allowed=lambda: self.profile != "game",
+            noname=lambda text: self._noname(mic, text))
+
+    _tts_end_at = 0.0
+
+    def _tts_quiet(self) -> bool:
+        from .noname import TTS_GAP_S
+        sp = self.speaker
+        busy = False
+        if sp is not None:
+            q = getattr(sp, "_q", None)
+            busy = bool(getattr(sp, "speaking", False) or getattr(sp, "busy", False)
+                        or (q is not None and getattr(q, "unfinished_tasks", 0)))
+        return not busy and time.monotonic() - self._tts_end_at >= TTS_GAP_S
+
+    def _noname(self, mic, text: str) -> bool:
+        """1.0.8: a phrase without «Джарвис» -> run silently if it is exactly a safe, known command."""
+        from . import noname
+        conf = getattr(self.stt, "last_conf", None)
+        cmd = noname.decide(text, self.cfg["assistant"], conf, self._tts_quiet(), self.router)
+        if cmd is None:
+            return False
+        log.info("Без имени: %r (conf=%s)", cmd, conf)
+        self.submit(cmd, "noname")
+        self.wait_idle(self.STUCK_S)
+        mic.clear()
+        return True
 
     # ---------------------------------------------------------------- voice loop supervision (1.0.7)
     STUCK_S = 60.0          # listening / thinking / speaking longer than this = stuck -> reset
     DEAF_S = 15.0           # no mic frames consumed while waiting for the wake word -> restart the stream
+    MIC_GRACE_S = 5.0       # after a restart the mic gets this long before it can be declared dead
+
+    def _stuck_limit(self, st: str) -> float:
+        """THINKING may legitimately last a whole LLM turn + one bounded retry; the others STUCK_S."""
+        if st == "thinking":
+            llm = getattr(self, "llm", None)
+            from .llm import RETRY_TIMEOUT_S
+            return max(self.STUCK_S, float(getattr(llm, "turn_timeout", 90) or 90) + RETRY_TIMEOUT_S + 10)
+        return self.STUCK_S
 
     def run_voice(self) -> None:
         """Supervisor: the listening session is re-opened after ANY error or a restart request, so one bad phrase,
@@ -821,6 +921,12 @@ class Assistant:
                 sp.interrupt()
             except Exception as e:                        # noqa: BLE001
                 log.debug("interrupt: %s", e)
+        if reason == "по запросу" or reason.startswith("завис"):
+            try:
+                self.llm.cancel()                         # 1.0.8: never keep waiting on a stuck LLM answer
+            except Exception as e:                        # noqa: BLE001
+                log.debug("llm cancel: %s", e)
+        self._hb = time.monotonic() + self.MIC_GRACE_S    # a reopened stream needs a few seconds for frames
         ev = getattr(self, "_relisten", None)
         if ev is not None:
             ev.set()
@@ -843,7 +949,7 @@ class Assistant:
             sp.interrupt()
             return "tts"
         st, since = getattr(self, "_vstate", ("", now))
-        if st in ("listening", "thinking", "speaking") and now - since > self.STUCK_S:
+        if st in ("listening", "thinking", "speaking") and now - since > self._stuck_limit(st):
             log.warning("Состояние «%s» держится %.0f с — сбрасываю прослушку", st, now - since)
             self._vstate = ("", now)
             self.restart_listening(f"завис в состоянии {st}")

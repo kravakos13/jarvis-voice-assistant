@@ -250,6 +250,8 @@ def test_router_routes_close_before_llm():
     assert "windows" in r.by_name
     res = r.handle("Джарвис, закрой ютуб!")
     assert res is not None and ("Windows" in res.reply or "ютуб" in res.reply)
+    assert not any(t["function"]["name"] == "close_window" for t in r.tool_schemas())   # 1.0.8: core tools only
+    cfg["llm"]["tools"] = "all"                                                        # «Нагрузка: максимальная»
     assert any(t["function"]["name"] == "close_window" for t in r.tool_schemas())
 
 

@@ -104,7 +104,7 @@ def test_visible_order_and_type_filters():
     assert run(sk, "открой второй файл") == "Открываю отчёт." and sh.opened == [r"C:\u\отчёт.docx"]
     assert run(sk, "открой первый файл") == "Открываю смета."
     assert run(sk, "открой вторую папку") == "Открыл папку Музыка." and sh.cur == r"C:\u\Музыка"
-    assert run(sk, "назад") == "Назад: u."
+    assert sk.match("назад", "назад") is None           # 1.0.8: «назад» = nav skill (Alt+Left), see test_noname_keys_nav
     assert run(sk, "открой второе") == "Открываю смета."              # bare: all items, view order
     assert run(sk, "открой последнюю папку") == "Открыл папку Архив."
     assert run(sk, "вверх") == "Поднялся в u."

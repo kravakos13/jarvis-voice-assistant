@@ -120,7 +120,7 @@ def test_warm_up_loads_model_with_the_real_prefix():
     assert c.warm(TOOLS) is not None
     p = s.payloads[-1]
     assert p["tools"] == TOOLS and p["messages"][0] == c._system_message()
-    assert p["options"]["num_predict"] == 1 and p["keep_alive"] == "30m"
+    assert p["options"]["num_predict"] == 1 and p["keep_alive"] == "5m"
     assert c.last_stats["load_s"] == 3.0
 
 
@@ -150,11 +150,11 @@ def test_switch_to_cpu_rewarms_with_num_gpu_0():
     assert c.set_on_cpu(True) is False                                   # no change -> no reload
 
 
-def test_embeddings_run_on_cpu_and_stay_loaded():
+def test_embeddings_run_on_cpu_and_unload_soon():
     c, s = chat()
     c.embed(["кот"])
     p = s.payloads[-1]
-    assert p["options"] == {"num_gpu": 0} and p["keep_alive"] == "30m"
+    assert p["options"] == {"num_gpu": 0, "num_thread": 2} and p["keep_alive"] == "1m"   # 1.0.8: lazy, unloaded
 
 
 @pytest.mark.parametrize("ps,share", [
@@ -177,7 +177,7 @@ def _assistant(placement="auto", profile="work"):
 def test_auto_placement_moves_llm_to_ram_in_game_instead_of_unloading():
     a, c = _assistant("auto")
     a.release_gpu()
-    assert c.on_cpu and c.keep_alive == "30m"                            # still answers in the game
+    assert c.on_cpu and c.keep_alive == "5m"                            # still answers in the game
     a.restore_gpu()
     assert not c.on_cpu
 
@@ -188,7 +188,7 @@ def test_gpu_placement_keeps_old_unload_in_game():
     a.release_gpu()
     assert not c.on_cpu and c.keep_alive == 0
     a.restore_gpu()
-    assert c.keep_alive == "30m"
+    assert c.keep_alive == "5m"
 
 
 def test_settings_switch_placement_live():
@@ -200,21 +200,30 @@ def test_settings_switch_placement_live():
 
 
 # ---------------------------------------------------------------- Ollama server env, Whisper, config
-def test_ollama_server_env_saves_vram_but_user_vars_win(monkeypatch):
+def test_ollama_server_env_is_safe_by_default_and_user_vars_win(monkeypatch):
+    """1.0.8: GTX 1660 Super (TU116) garbage output -> FA off, f16 KV by default; NUM_PARALLEL/MAX_LOADED = 1."""
+    from jarvis import ollama_setup as osu
+    monkeypatch.delenv("OLLAMA_FLASH_ATTENTION", raising=False)
+    monkeypatch.setenv("OLLAMA_KV_CACHE_TYPE", "q4_0")
+    env = osu._serve_env("http://localhost:11434", osu.server_env_for({}))
+    assert env["OLLAMA_FLASH_ATTENTION"] == "0" and env["OLLAMA_NUM_PARALLEL"] == "1"
+    assert env["OLLAMA_KV_CACHE_TYPE"] == "q4_0"                         # the user's own choice is kept...
+    forced = osu._serve_env("http://localhost:11434", osu.server_env_for({}), force_safe=True)
+    assert forced["OLLAMA_KV_CACHE_TYPE"] == "f16" and forced["OLLAMA_FLASH_ATTENTION"] == "0"   # ...unless garbage
+
+
+def test_fast_kv_is_opt_in_and_gpu_only(monkeypatch):
     from jarvis import cuda_libs
     from jarvis import ollama_setup as osu
     monkeypatch.setattr(cuda_libs, "nvidia_gpu_present", lambda *a, **k: True)
-    monkeypatch.delenv("OLLAMA_FLASH_ATTENTION", raising=False)
-    monkeypatch.setenv("OLLAMA_KV_CACHE_TYPE", "f16")
-    env = osu._serve_env("http://localhost:11434")
-    assert env["OLLAMA_FLASH_ATTENTION"] == "1" and env["OLLAMA_NUM_PARALLEL"] == "1"
-    assert env["OLLAMA_KV_CACHE_TYPE"] == "f16"                          # the user's own choice is kept
+    assert osu.server_env_for({"fast_kv": True})["OLLAMA_KV_CACHE_TYPE"] == "q8_0"
+    monkeypatch.setattr(cuda_libs, "nvidia_gpu_present", lambda *a, **k: False)
+    assert osu.server_env_for({"fast_kv": True})["OLLAMA_FLASH_ATTENTION"] == "0"
 
 
 def test_ollama_tray_app_also_gets_the_env(monkeypatch):
-    from jarvis import cuda_libs
     from jarvis import ollama_setup as osu
-    monkeypatch.setattr(cuda_libs, "nvidia_gpu_present", lambda *a, **k: True)
+    monkeypatch.delenv("OLLAMA_FLASH_ATTENTION", raising=False)
     seen = []
     state = {"up": False}
     monkeypatch.setattr(osu, "is_running", lambda host, session=None: state["up"])
@@ -225,7 +234,7 @@ def test_ollama_tray_app_also_gets_the_env(monkeypatch):
         state["up"] = True
     assert osu.start({"llm": {}}, popen=popen, sleep=lambda s: None, find=lambda: "C:/Ollama/ollama.exe",
                      procs=lambda: [])
-    assert seen and seen[0]["OLLAMA_FLASH_ATTENTION"] == "1"
+    assert seen and seen[0]["OLLAMA_FLASH_ATTENTION"] == "0"
 
 
 def test_whisper_auto_compute_is_float16_on_gpu_like_1_0_4():
@@ -237,7 +246,8 @@ def test_whisper_auto_compute_is_float16_on_gpu_like_1_0_4():
 
 def test_defaults_and_migration_v5():
     from jarvis import config as C
-    assert C.DEFAULTS["llm"]["num_ctx"] == 6144 and C.DEFAULTS["llm"]["placement"] == "gpu"
+    assert C.DEFAULTS["llm"]["num_ctx"] is None and C.DEFAULTS["llm"]["placement"] == "gpu"   # 1.0.8: preset
+    assert C.apply_load_preset({})["llm"]["num_ctx"] == 4096 and C.apply_load_preset({"load": {"preset": "max"}})["llm"]["num_ctx"] == 6144
     assert C.DEFAULTS["assistant"]["ack_after_s"] == 2.5
     d, ch = C.migrate_local({"config_version": 4, "llm": {"num_ctx": 8192, "model": "qwen2.5:7b"}})
     assert ch and d["llm"] == {"model": "qwen2.5:7b"} and d["config_version"] == C.CONFIG_VERSION >= 5
@@ -376,6 +386,6 @@ def test_cpu_only_ollama_gets_no_quantized_kv(monkeypatch):
     monkeypatch.delenv("OLLAMA_KV_CACHE_TYPE", raising=False)
     monkeypatch.delenv("OLLAMA_FLASH_ATTENTION", raising=False)
     monkeypatch.setattr(cuda_libs, "nvidia_gpu_present", lambda *a, **k: False)
-    env = osu._serve_env("http://localhost:11434")
-    assert "OLLAMA_KV_CACHE_TYPE" not in env and "OLLAMA_FLASH_ATTENTION" not in env
+    env = osu._serve_env("http://localhost:11434", osu.server_env_for({"fast_kv": True}))
+    assert env["OLLAMA_KV_CACHE_TYPE"] == "f16" and env["OLLAMA_FLASH_ATTENTION"] == "0"
     assert env["OLLAMA_NUM_PARALLEL"] == "1"

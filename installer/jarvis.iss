@@ -64,6 +64,7 @@ Name: "{app}\models"
 Name: "{group}\{#AppName}"; Filename: "{app}\python\pythonw.exe"; Parameters: "-m jarvis.watchdog"; WorkingDir: "{app}"; IconFilename: "{app}\assets\jarvis.ico"
 Name: "{group}\{#AppName} (текстовый режим)"; Filename: "{app}\python\python.exe"; Parameters: "-m jarvis --text"; WorkingDir: "{app}"; IconFilename: "{app}\assets\jarvis.ico"
 Name: "{group}\Самопроверка"; Filename: "{app}\python\python.exe"; Parameters: "-m jarvis --check"; WorkingDir: "{app}"; IconFilename: "{app}\assets\jarvis.ico"
+Name: "{group}\Инструкция"; Filename: "{app}\python\pythonw.exe"; Parameters: "-m jarvis.manual --open"; WorkingDir: "{app}"; IconFilename: "{app}\assets\jarvis.ico"
 Name: "{group}\Докачать компоненты"; Filename: "{app}\python\python.exe"; Parameters: "installer\postinstall.py"; WorkingDir: "{app}"
 Name: "{group}\Удалить {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\python\pythonw.exe"; Parameters: "-m jarvis.watchdog"; WorkingDir: "{app}"; IconFilename: "{app}\assets\jarvis.ico"; Tasks: desktopicon

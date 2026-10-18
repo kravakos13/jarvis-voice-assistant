@@ -301,6 +301,7 @@ class Controller(QObject):
         m.addAction("Синхронизировать", self.sync_now)
         m.addAction("Самодиагностика", self.run_diagnostics)
         m.addAction("Проверить обновления", lambda: self.check_updates(manual=True))
+        m.addAction("Инструкция", self.open_manual)
         m.addSeparator()
         m.addAction("Выход", self.quit)
         self.tray_menu = m
@@ -892,6 +893,14 @@ class Controller(QObject):
         except Exception as e:
             log.exception("Голосовой режим на процессоре тоже не запустился: %s", e)
             return False
+
+    def open_manual(self):
+        """Tray «Инструкция»: docs/ИНСТРУКЦИЯ.md rendered to HTML in the default browser (no network)."""
+        try:
+            from ..manual import open_manual
+            open_manual()
+        except Exception as e:                           # noqa: BLE001
+            log.warning("Инструкция не открылась: %s", e)
 
     def restart_listening(self) -> None:
         """Tray: re-open the microphone and reset the voice state machine; revive the loop if it ended."""

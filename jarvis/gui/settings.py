@@ -344,6 +344,26 @@ class SettingsDialog(QDialog):
                   tip="Если за это время ничего не сказать, Джарвис молча засыпает")
         self._add(f, "assistant.ack_after_s", "Сказать «Секунду», если ответ дольше", "float", min=0.0, max=10.0,
                   step=0.5, decimals=1, suffix=" с", tip="0 — никогда")
+        from ..noname import GROUPS
+        fn = self._group(v, "Команды без имени")
+        self._add(fn, "assistant.noname.enabled", "Команды без имени (короткие команды без «Джарвис»)", "bool",
+                  tip="Только целая короткая фраза-команда, чётко распознанная, не во время речи Джарвиса. "
+                      "Выполняется молча. Разговор, поиск, заметки, выключение ПК — только с именем.")
+        for gid, title in GROUPS:
+            self._add(fn, f"assistant.noname.groups.{gid}", title, "bool")
+        self._add(fn, "assistant.conversation.enabled", "Режим беседы («давай поболтаем» — дальше без имени)", "bool",
+                  tip="Начинается фразами «давай поболтаем», «расскажи что-нибудь», «как дела». Заканчивается словами "
+                      "«хватит болтать», «пока», «спасибо, всё», «тихо» или после тишины.")
+        self._add(fn, "assistant.conversation.idle_s", "Беседа: выйти после тишины", "int", min=10, max=120, suffix=" с")
+        from ..resources import PRESET_NAMES
+        fl = self._group(v, "Нагрузка на компьютер")
+        self._add(fl, "load.preset", "Нагрузка", "combo", options=list(PRESET_NAMES.items()),
+                  tip="Обычная: модель qwen2.5:7b, 4 потока, ИИ выгружается из памяти через 5 мин простоя, приоритет "
+                      "ниже обычного. Лёгкая: модель qwen2.5:3b (~2 ГБ) — легче для слабых ПК и игр, ответы проще. "
+                      "Максимальная: все ядра, модель держится 30 мин, обычный приоритет (как в 1.0.7).")
+        self._add(fl, "ollama.fast_kv", "Экономия видеопамяти (flash attention + KV q8) — только для RTX", "bool",
+                  tip="На GTX 16xx/10xx и на процессоре из-за этого ИИ отвечал «китайским мусором». По умолчанию выкл.")
+        self._add(fl, "ollama.selftest", "Самопроверка ИИ после запуска (мусор -> перезапуск Ollama)", "bool")
         f2 = self._group(v, "Запуск")
         self._add(f2, "autostart.enabled", "Запускать вместе с Windows", "bool")
         self._add(f2, "gui.start_minimized", "Запускаться свёрнутым в трей", "bool")
@@ -526,7 +546,6 @@ class SettingsDialog(QDialog):
         self._add(f2, "gui.color", "Цвет", "color")
         self._add(f2, "gui.animations", "Анимации", "combo",
                   options=[("full", "Полные"), ("lite", "Облегчённые (слабый ПК)"), ("off", "Почти без анимации")])
-        self._add(f2, "gui.fps", "Кадров в секунду (полные)", "int", min=15, max=60)
         self._add(f2, "gui.face_style", "Стиль лица", "combo",
                   options=[("image", "Своё лицо (картинка, WebGL)"), ("3d", "3D-голова (WebGL)"),
                            ("2d", "Простая 2D-голова (без WebGL)")],

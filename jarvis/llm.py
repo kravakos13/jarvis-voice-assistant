@@ -16,7 +16,7 @@ import logging
 import re
 import threading
 import time
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 import requests
 
@@ -95,7 +95,8 @@ def _stats(data: dict) -> dict:
             "prompt_tokens": int(data.get("prompt_eval_count") or 0),
             "prompt_s": round(float(data.get("prompt_eval_duration") or 0) / ns, 2),
             "eval_tokens": ev, "eval_s": round(evd / ns, 2),
-            "tok_s": round(ev / (evd / ns), 1) if evd else 0.0,
+            # 1.0.8: «генерация 1000000 ток/с» — 1 token in ~1 µs (cached / aborted answer) is not a speed
+            "tok_s": round(ev / (evd / ns), 1) if ev >= 4 and evd >= 0.05 * ns else 0.0,
             "total_s": round(float(data.get("total_duration") or 0) / ns, 2)}
 
 
@@ -105,7 +106,15 @@ class OllamaChat:
         self.model = cfg.get("model", "qwen2.5:7b")
         self.system_prompt = cfg.get("system_prompt", "")
         self.temperature = float(cfg.get("temperature", 0.5))
-        self.num_ctx = max(2048, int(cfg.get("num_ctx", 6144)))
+        self.num_ctx = max(2048, int(cfg.get("num_ctx") or 4096))
+        self.num_thread = int(cfg.get("num_thread") or 0)            # 1.0.8: CPU threads for Ollama (0 = its default)
+        self.vram_headroom = float(cfg.get("vram_headroom_gb", 1.0) or 0)
+        self.min_free_ram = float(cfg.get("min_free_ram_gb", 6.0) or 0)
+        self.num_gpu: Optional[int] = None         # auto-fit: GPU layers (None = all fit, Ollama decides)
+        self.blocked = ""                          # not enough memory: Russian reason, LLM not used
+        self._fit_at = 0.0
+        self._cancel = threading.Event()
+        self._resp: Any = None
         self.num_predict = int(cfg.get("num_predict", 512))          # voice answers are short
         self.top_p = float(cfg.get("top_p", 0.9))
         self.top_k = int(cfg.get("top_k", 40))
@@ -113,7 +122,7 @@ class OllamaChat:
         self.max_history = int(cfg.get("max_history_messages", 16))
         self.timeout = float(cfg.get("timeout_s", 120))
         self.turn_timeout = float(cfg.get("turn_timeout_s", 90))   # whole streamed answer, incl. slow CPU prompt
-        self.keep_alive = cfg.get("keep_alive", "30m")
+        self.keep_alive = cfg.get("keep_alive") or "5m"
         # extra models (coder, vision) are unloaded quickly to fit into 6 GB VRAM
         self.aux_keep_alive = cfg.get("aux_keep_alive", "1m")
         # where the model runs: "gpu" (fastest), "cpu" (num_gpu=0: frees VRAM, ~3-5x slower), "auto" (GPU; CPU in games)
@@ -156,9 +165,13 @@ class OllamaChat:
         content = f"{self.system_prompt}\n\n{stamp}\n\n{RU_RULE}"   # RU_RULE last: survives custom prompts
         return {"role": "system", "content": content}
 
+    style_hint = ""                                # e.g. conversation mode (in the user note: system stays cached)
+
     def _turn_context(self) -> str:
         now = _dt.datetime.now()
         parts = [f"Сейчас {now:%H:%M}."]
+        if self.style_hint:
+            parts.append(self.style_hint)
         if self.context_provider and self._last_user_text:
             try:
                 extra = self.context_provider(self._last_user_text) or ""
@@ -187,9 +200,96 @@ class OllamaChat:
              "num_ctx": num_ctx or self.num_ctx}
         if num_predict:
             o["num_predict"] = num_predict
+        if self.num_thread > 0:
+            o["num_thread"] = self.num_thread       # 1.0.8: leave CPU cores to Windows and the user
         if self.on_cpu:
             o["num_gpu"] = 0                        # all layers in RAM: VRAM stays free (games), slower
+        elif self.num_gpu is not None:
+            o["num_gpu"] = self.num_gpu             # auto-fit: what fits with ~1 GB VRAM headroom
         return o
+
+    # ---------------------------------------------------------------- 1.0.8: memory fit / self-test / cancel
+    def _model_meta(self) -> tuple[float, int]:
+        """(size GB, layers) of self.model from Ollama (/api/tags, /api/show); defaults for qwen2.5:7b."""
+        size, layers = 4.7, 28
+        try:
+            for m in self.http.get(f"{self.host}/api/tags", timeout=3).json().get("models", []) or []:
+                if m.get("name") in (self.model, self.model + ":latest") or m.get("model") == self.model:
+                    size = float(m.get("size") or 0) / 1e9 or size
+            info = self.http.post(f"{self.host}/api/show", json={"model": self.model}, timeout=5).json()
+            for k, v in (info.get("model_info") or {}).items():
+                if k.endswith(".block_count"):
+                    layers = int(v)
+        except Exception as e:                       # noqa: BLE001
+            log.debug("model meta: %s", e)
+        return size, layers
+
+    def _installed(self, name: str) -> bool:
+        try:
+            names = [m.get("name") for m in self.http.get(f"{self.host}/api/tags", timeout=3).json().get("models", [])]
+            return name in names or name + ":latest" in names
+        except Exception:                            # noqa: BLE001
+            return False
+
+    def ensure_fit(self, force: bool = False) -> str:
+        """Before (re)loading the model: put on the GPU only the layers that fit with headroom; if the rest would
+        spill into RAM while free RAM is low, switch to the light model or refuse (never a silent CPU+RAM spill
+        that makes Windows swap). Returns '' or a Russian reason. Cheap when the model is already loaded."""
+        from . import resources
+        now = time.monotonic()
+        if not force and now - self._fit_at < 20:
+            return self.blocked
+        self._fit_at = now
+        if self.on_cpu:
+            self.blocked = ""
+            return ""
+        vr = resources.vram_gb()
+        if vr is None:                              # no NVIDIA GPU / nvidia-smi: Ollama decides itself
+            self.num_gpu, self.blocked = None, ""
+            return ""
+        loaded = self.placement_info()
+        if loaded and not force:
+            return self.blocked                     # already in memory: nothing to decide
+        size, layers = self._model_meta()
+        n = resources.fit_layers(size, layers, self.num_ctx, vr[1] if vr else None, self.vram_headroom)
+        spill = resources.spill_gb(size, layers, n)
+        free_ram = resources.free_ram_gb()
+        self.num_gpu, self.blocked = n, ""
+        if n is not None:
+            log.warning("ИИ %s: в видеопамять влезает %d из %d слоёв (свободно %.1f ГБ, запас %.1f ГБ), %.1f ГБ уйдёт "
+                        "в оперативку", self.model, n, layers + 1, vr[1] if vr else -1, self.vram_headroom, spill)
+            if free_ram is not None and free_ram - spill < self.min_free_ram:
+                # never a silent switch to another model and never a silent CPU+RAM spill (Windows swapping)
+                self.blocked = (f"Сейчас мало свободной памяти: видеопамяти {vr[1] if vr else 0:.1f} ГБ, оперативки "
+                                f"{free_ram:.1f} ГБ. Чтобы не перегружать компьютер, ИИ-ответы пока на паузе — "
+                                "команды работают. Закрой тяжёлые программы или выбери «Нагрузка: Лёгкая» в настройках.")
+                log.warning("ИИ не загружаю: %s", self.blocked)
+        return self.blocked
+
+    def selftest(self) -> str:
+        """'ok' / 'garbage' / 'error': a tiny question; non-Cyrillic or CJK output = broken generation."""
+        try:
+            r = self.http.post(f"{self.host}/api/chat", timeout=60, json={
+                "model": self.model, "stream": False, "keep_alive": self.keep_alive,
+                "messages": [{"role": "user", "content": "Ответь одним словом по-русски: да или нет? Скажи «да»."}],
+                "options": {**self.options(temperature=0.0, num_predict=8), "num_ctx": 512}})
+            text = ((r.json().get("message") or {}).get("content") or "").strip()
+        except Exception as e:                       # noqa: BLE001
+            log.info("Самопроверка ИИ: %s", e)
+            return "error"
+        bad = has_cjk(text) or not re.search(r"[а-яё]", text.lower())
+        log.info("Самопроверка ИИ: %r -> %s", text[:60], "МУСОР" if bad else "ok")
+        return "garbage" if bad else "ok"
+
+    def cancel(self) -> None:
+        """Abort the request in flight (tray «Перезапустить прослушку»)."""
+        self._cancel.set()
+        r = self._resp
+        if r is not None:
+            try:
+                r.close()
+            except Exception:                        # noqa: BLE001
+                pass
 
     def set_on_cpu(self, on_cpu: bool, warm_tools: Optional[list] = None) -> bool:
         """Move the model between GPU and RAM. Ollama reloads it when num_gpu changes; warm it right away
@@ -205,6 +305,8 @@ class OllamaChat:
         """Load the model and pre-evaluate the static prefix (system + tools) so the first real command
         is fast. Returns seconds, None on failure (never raises)."""
         t0 = time.monotonic()
+        if self.ensure_fit(force=True):
+            return None
         try:
             system = self._system_message()
             payload: dict = {"model": self.model, "stream": False, "keep_alive": self.keep_alive,
@@ -275,7 +377,10 @@ class OllamaChat:
                             timeout=(10, min(self.timeout, self.turn_timeout))) as r:
             if r.status_code != 200:
                 raise LLMError(f"Ollama вернула {r.status_code}: {r.text[:300]}")
+            self._resp = r
             for line in r.iter_lines():
+                if self._cancel.is_set():
+                    raise LLMError("cancelled: запрос отменён")
                 if not line:
                     continue
                 data = json.loads(line)
@@ -294,6 +399,9 @@ class OllamaChat:
         {"name": str, "arguments": dict}; the caller executes them and should
         then call `add_assistant_message()` with the spoken result.
         """
+        self._cancel.clear()
+        if self.ensure_fit():
+            raise LLMError(f"memory: {self.blocked}")
         self.history.append({"role": "user", "content": user_text})
         self._trim()
         self._last_user_text = user_text
@@ -332,10 +440,14 @@ class OllamaChat:
                     yield piece
         except requests.RequestException as e:
             self._drop_last_user()
+            if self._cancel.is_set():
+                raise LLMError("cancelled: запрос отменён") from e
             raise LLMError(f"Ошибка связи с Ollama: {e}") from e
         except LLMError:
             self._drop_last_user()
             raise
+        finally:
+            self._resp = None
         if tool_calls_out is not None:
             tool_calls_out.extend(calls)
         answer = strip_think("".join(parts)).strip()
@@ -416,7 +528,7 @@ class OllamaChat:
                        temperature: Optional[float], num_ctx: Optional[int], timeout: Optional[float],
                        num_predict: Optional[int] = None) -> str:
         main = (model or self.model) == self.model
-        payload = {
+        payload: dict[str, Any] = {
             "model": model or self.model,
             "messages": messages,
             "stream": False,
@@ -442,8 +554,9 @@ class OllamaChat:
     def embed(self, texts: list[str], model: str = "nomic-embed-text") -> list[list[float]]:
         # num_gpu=0: the small embedding model runs on the CPU (~0.1 s) and never pushes the main model out
         # of 6 GB VRAM (Ollama evicts a loaded model when a new one does not fit -> multi-second reload)
-        r = self.http.post(f"{self.host}/api/embed", json={"model": model, "input": texts, "keep_alive": self.keep_alive,
-                                                           "options": {"num_gpu": 0}}, timeout=60)
+        # 1.0.8: unloaded after 1 min (lazy: loaded only when memory is searched/added), 2 CPU threads
+        r = self.http.post(f"{self.host}/api/embed", json={"model": model, "input": texts, "keep_alive": "1m",
+                                                           "options": {"num_gpu": 0, "num_thread": 2}}, timeout=60)
         if r.status_code != 200:
             raise LLMError(f"embed {r.status_code}: {r.text[:200]}")
         return r.json().get("embeddings") or []

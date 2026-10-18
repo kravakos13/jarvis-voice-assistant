@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 
 # (config section with `enabled`, module, class). ORDER MATTERS: first match wins.
 SKILLS = [
+    ("chat", "chat_skill", "ChatSkill"),                 # 1.0.8 «Режим беседы»: «давай поболтаем» (LLM answers)
     ("diagnostics", "diag_skill", "DiagSkill"),
     ("lumo", "lumo_skill", "LumoSkill"),
     ("profiles", "modes_skill", "ModesSkill"),
@@ -28,6 +29,8 @@ SKILLS = [
     ("weather", "weather_skill", "WeatherSkill"),
     ("system", "system_skill", "SystemSkill"),
     ("explorer", "explorer_skill", "ExplorerSkill"),     # before smarthome/media: «открой второе» by context
+    ("nav", "nav_skill", "NavSkill"),                    # «назад/вперёд [N раз]», «перемотай назад на 30 секунд»
+    ("keys", "keys_skill", "KeysSkill"),                 # «нажми энтер / контрол цэ / вниз три раза»
     ("hotkeys", "hotkeys_skill", "HotkeysSkill"),        # data-driven: jarvis/commands.yaml (+ user file)
     ("smarthome", "smarthome_skill", "SmartHomeSkill"),
     ("windows", "windows_skill", "WindowsSkill"),
@@ -108,6 +111,8 @@ class Router:
             ctx.extra["screen"] = self.by_name["screen"].reader
         if "windows" in self.by_name:
             ctx.extra["wm"] = self.by_name["windows"].wm
+        if "media" in self.by_name:
+            ctx.extra["media"] = self.by_name["media"].media
         if "apps" in self.by_name:
             ctx.extra["launcher"] = self.by_name["apps"].launcher
         log.info("Модули: %s", ", ".join(s.name for s in self.skills))
@@ -124,6 +129,15 @@ class Router:
         if self.pending_confirm or self.pending_expect:
             return True
         return any(getattr(s, "awaiting", False) for s in self.skills)
+
+    def after_turn(self) -> None:
+        for s in self.skills:
+            fn = getattr(s, "after_turn", None)
+            if fn:
+                try:
+                    fn()
+                except Exception as e:                  # noqa: BLE001
+                    log.debug("after_turn %s: %s", s.name, e)
 
     @property
     def awaiting_timeout(self) -> Optional[float]:
@@ -151,7 +165,8 @@ class Router:
 
     def handle(self, text: str) -> Optional[ToolResult]:
         self.last_skill = ""
-        t = normalize(text)
+        from .noname import canonical
+        t = canonical(normalize(text))                 # «открыл ютуб» (Whisper) -> «открой ютуб»
         if not t:
             return None
         if self.pending_confirm:
@@ -189,6 +204,18 @@ class Router:
                 r = self._match(cleaned, cleaned)
                 if r is not None:
                     log.debug("быстрый путь после очистки: %r -> %r", t, cleaned)
+        if r is None:
+            from . import fuzzy
+            from .noname import canonical
+            for v in fuzzy.variants(cleaned or t):
+                r = self._match(v, canonical(v))
+                if r is not None:
+                    log.info("Команда исправлена: %r -> %r", t, v)
+                    break
+            if r is None and fuzzy.looks_like_command(cleaned or t):
+                self.last_skill = "unknown"
+                log.info("Похоже на команду, но не понял: %r — в ИИ не отправляю", t)
+                return ToolResult("Не понял команду.")
         return self._finalize(r) if r is not None else None
 
     def _match(self, text: str, t: str) -> Optional[ToolResult]:
@@ -213,13 +240,22 @@ class Router:
             return ToolResult(f"Не получилось: {e}")
 
     # ------------------------------------------------------------ tool calling
+    # 1.0.8 (llm.tools: core, «Нагрузка» обычная/лёгкая): only the tools the model really needs are offered.
+    # Direct commands («открой», «пауза», «закрой ютуб», «громкость 30») are handled by the fast path before the LLM,
+    # so their schemas only cost prompt tokens (28 tools ≈ 1.9k of the 2.3-2.4k token prompt in users' logs).
+    CORE_TOOLS = {"web_answer", "weather", "remember_fact", "add_task", "list_tasks", "set_timer", "play_music",
+                  "play_video", "open_website", "launch_app", "calculate", "add_note", "smart_device", "look_at_screen"}
+
     def tool_schemas(self) -> list[dict]:
+        which = str((self.ctx.cfg.get("llm") or {}).get("tools") or "all")
         out = []
         for skill in self.skills:
             try:
                 out += skill.tools()
             except Exception as e:
                 log.debug("tools() %s: %s", skill.name, e)
+        if which == "core":
+            out = [t for t in out if t["function"]["name"] in self.CORE_TOOLS]
         return out
 
     def call_tool(self, name: str, args: dict) -> Optional[ToolResult]:

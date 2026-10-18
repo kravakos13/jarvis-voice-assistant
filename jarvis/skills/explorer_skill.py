@@ -27,6 +27,8 @@ class ExplorerSkill(Skill):
         p = parse(t)
         if p is None:
             return None
+        if p.kind == "back":
+            return None                                   # 1.0.8: generic «назад» (nav skill: Alt+Left everywhere)
         if p.kind in ("back", "up"):
             w = self.ex.active()                          # only when Explorer is the window in front
             return self._run(w, p) if w is not None else None

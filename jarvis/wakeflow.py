@@ -34,6 +34,7 @@ class WakeFlow:
     awaiting_timeout: Callable[[], Optional[float]] = lambda: None   # e.g. dictation: re-check after its idle limit
     cfg: dict = field(default_factory=dict)              # the "assistant" config section
     follow_allowed: Callable[[], bool] = lambda: True    # False in the game profile
+    noname: Callable[[str], bool] = lambda text: False   # 1.0.8: ran it as a command without the name?
     clock: Callable[[], float] = time.monotonic
     follow_until: float = 0.0
     state: str = SLEEPING
@@ -84,6 +85,11 @@ class WakeFlow:
         if open_window:
             self._run(text)
             return "reply"
+        try:
+            if self.noname(text):
+                return "noname"
+        except Exception as e:                           # noqa: BLE001
+            log.exception("no-name: %s", e)
         log.debug("(без имени, сплю дальше): %s", text)
         self.follow_until = 0.0
         return "ignored"

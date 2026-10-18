@@ -21,8 +21,13 @@ CLOSE_V = (r"закрой|закрои|закрою|закройте|закры�
 MIN_V = (r"сверни|свернуть|сверни ка|сверните|спрячь|скрой|"
          r"сюрни|свирни|сверне|зверни|сверли|свёрни|сварни|сверний|сверну")      # Whisper typos (user log: «Сюрни Хром»)
 MAX_V = r"разверни|развернуть|разверни ка|раскрой|открой на весь экран|разверне|розверни|развирни"
-ACT_V = (r"переключись на|переключи на|переключиться на|перейди в|перейди на|перейди к|вернись в|вернись к|"
+ACT_V = (r"переключись на|переключи на|переключиться на|переключись в|перейди в|перейди на|перейди к|"
+         r"вернись на|вернись в|вернись к|вернусь на|вернусь в|верни на|верни в|вернемся на|вернемся в|вернёмся на|"
+         r"вернёмся в|давай обратно на|давай обратно в|обратно на|обратно в|"
          r"покажи окно|активируй|сделай активным|давай в|открой окно")
+BACK_TO_PREV = re.compile(r"^(?:ну |давай |а )?(?:вернись|вернись обратно|вернемся|вернёмся|верни обратно|"
+                          r"назад в прошлое окно|предыдущее окно|прошлое окно|в прошлое окно)$")
+OPENABLE = {"ютуб": "youtube", "ютуб музыка": "ytmusic"}       # «вернись на ютуб» opens it if nothing is open
 VERB_RE = re.compile(rf"^(?:(?:ну|давай|джарвис|эй|слушай|а|пожалуйста)\s+)*({ACT_V}|{CLOSE_V}|{MIN_V}|{MAX_V})\b\s*(.*)$")
 FILLERS = {
     "ну", "давай", "пожалуйста", "плиз", "быстро", "срочно", "уже", "мне", "ка", "там", "тут", "вот", "же", "то",
@@ -47,9 +52,13 @@ def _target_words(rest: str) -> str:
 class WindowsSkill(Skill):
     name = "windows"
 
-    def __init__(self, ctx, manager: Optional[wn.WindowManager] = None, start: bool = True):
+    def __init__(self, ctx, manager: Optional[wn.WindowManager] = None, start: bool = True,
+                 tabs=None, select_tab=None):
         super().__init__(ctx)
         self.wm = manager or wn.WindowManager(wn.default_backend())
+        from .. import uia
+        self.tabs = tabs or uia.browser_tabs
+        self.select_tab = select_tab or uia.select_tab
         self._stop = threading.Event()
         if start and self.wm.b is not None:
             threading.Thread(target=self._track_loop, name="jarvis-fgwin", daemon=True).start()
@@ -147,21 +156,51 @@ class WindowsSkill(Skill):
         return ToolResult(f"{verb} {label}." if ok else f"Не получилось: окно {label} не поддаётся.")
 
     def switch(self, name: str) -> Optional[ToolResult]:
-        """«переключись на хром»: bring an open window to the front (restore if minimized). Not open -> None,
-        so «перейди в телеграм» can still be handled by the apps skill (launch)."""
+        """«переключись на хром», «вернись на ютуб»: an open window -> front (restored if minimized); else a
+        background browser TAB whose title matches (UIA); else known sites (ютуб, ютуб музыка) are opened.
+        Nothing found -> None, so «перейди в телеграм» can still be handled by the apps skill (launch)."""
         if self.wm.b is None:
             return ToolResult("Управлять окнами я умею только в Windows.")
-        wins, label, _ = self._windows_for(name)
-        if not wins:
-            return None
-        w = wins[0]
+        wins, label, tgt = self._windows_for(name)
+        if wins:
+            w = wins[0]
+            self.wm.show(w, "restore")
+            ok = self.wm.b.activate(w.hwnd)
+            return ToolResult(f"Переключился на {label}." if ok else f"Не получилось переключиться на {label}.")
+        rx = re.compile(tgt.title_re, re.I) if tgt is not None and tgt.title_re else None
+        words = [w for w in (name or "").lower().split() if len(w) >= 3]
+        for w in self.wm.candidates():
+            if not w.is_browser:
+                continue
+            for tab in self.tabs(w.hwnd):
+                tname = tab["name"]
+                if (rx and rx.search(tname) and not (tgt is not None and tgt.exclude_re and re.search(tgt.exclude_re, tname, re.I))) \
+                        or (rx is None and words and all(x in tname.lower() for x in words)):
+                    self.wm.show(w, "restore")
+                    ok = self.select_tab(tab["el"]) and self.wm.b.activate(w.hwnd)
+                    return ToolResult(f"Переключился на вкладку {label}." if ok else
+                                      f"Не получилось переключиться на {label}.")
+        media = self.ctx.extra.get("media")
+        if tgt is not None and tgt.key in OPENABLE and media is not None:
+            fn = media.open_youtube if OPENABLE[tgt.key] == "youtube" else media.open_ytmusic
+            return ToolResult(f"Открываю {tgt.title_ru}.", then=lambda: (fn(), None)[1])
+        return None
+
+    def back_to_previous(self) -> ToolResult:
+        if self.wm.b is None:
+            return ToolResult("Управлять окнами я умею только в Windows.")
+        w = self.wm.previous()
+        if w is None:
+            return ToolResult("Не помню, какое окно было до этого.")
         self.wm.show(w, "restore")
         ok = self.wm.b.activate(w.hwnd)
-        return ToolResult(f"Переключился на {label}." if ok else f"Не получилось переключиться на {label}.")
+        return ToolResult(f"Вернулся в {self._label(w)}." if ok else "Не получилось переключиться.")
 
     # ------------------------------------------------------------ voice
     def match(self, text: str, t: str) -> Optional[ToolResult]:
         t = t.replace("закрой-ка", "закрой ка")
+        if BACK_TO_PREV.match(t):
+            return self.back_to_previous()
         m = VERB_RE.match(t)
         if not m:
             return None

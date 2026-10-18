@@ -107,7 +107,7 @@ def prepare_app(cfg: dict) -> None:
 
 
 def make_face(parent, cfg: dict):
-    fps = int(cfg.get("gui", {}).get("fps", 30))
+    fps = min(30, int(cfg.get("gui", {}).get("fps") or 30))         # 1.0.8: capped at 30
     if want_3d(cfg):
         try:
             if face_style(cfg) == "3d":
@@ -197,7 +197,9 @@ class WebFace(QWidget):
             self._js(f"window.jarvis.setColor({json.dumps(self._color)})")
             if self.page_name == "face.html":
                 self._js(f"window.jarvis.setColorMode({json.dumps(self._color_mode)})")
+            self._js(f"window.jarvis.setMaxFps({int(min(30, self.base_fps))})")
             self._js(f"window.jarvis.setQuality({json.dumps(self._quality)})")
+            self._js(f"window.jarvis.setPaused({json.dumps(not self.isVisible())})")
             self._js(f"window.jarvis.setState({json.dumps(self.state)})")
         elif title == "error":
             self._fail("page error")
@@ -250,6 +252,17 @@ class WebFace(QWidget):
         if self._fallback is not None:
             self._fallback.set_color(c)
         self._js(f"window.jarvis.setColor({json.dumps(self._color)})")
+
+    # 1.0.8: no rendering while the window is hidden (tray) or minimized
+    def showEvent(self, e):  # noqa: N802
+        super().showEvent(e)
+        if self._ready:
+            self._js("window.jarvis.setPaused(false)")
+
+    def hideEvent(self, e):  # noqa: N802
+        super().hideEvent(e)
+        if self._ready:
+            self._js("window.jarvis.setPaused(true)")
 
     def set_animation(self, level: str) -> None:
         self._quality = level if level in ("full", "lite", "off") else "full"

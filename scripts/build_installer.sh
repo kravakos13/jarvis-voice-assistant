@@ -14,7 +14,9 @@ rm -rf build && mkdir -p "$STAGE/python"
 tar --exclude='__pycache__' --exclude='*.pyc' --exclude='.*' --exclude='build' --exclude='logs' \
     --exclude='voices/*.onnx*' --exclude='settings.local.yaml' --exclude='*.session*' --exclude='tests' \
     --exclude='cache' -cf - jarvis scripts installer assets voices firmware config.yaml aliases.yaml devices.yaml \
-    requirements*.txt Jarvis.vbs README.md CHANGELOG.md | tar -xf - -C "$STAGE"
+    docs requirements*.txt Jarvis.vbs README.md CHANGELOG.md | tar -xf - -C "$STAGE"
+# the manual, also pre-rendered to HTML (tray / Start menu «Инструкция» re-render it on open)
+python3 -c "import sys;sys.path.insert(0,'.');from pathlib import Path;from jarvis import manual;manual.build_html(dest=Path(sys.argv[1]))" "$STAGE/docs/ИНСТРУКЦИЯ.html"
 # Google OAuth client ("Desktop app") for Gmail/Drive - injected at build time, never committed:
 #   JARVIS_OAUTH_CLIENT=/secure/path/oauth_client.json scripts/build_installer.sh
 if [ -n "${JARVIS_OAUTH_CLIENT:-}" ]; then

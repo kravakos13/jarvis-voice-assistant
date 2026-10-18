@@ -21,7 +21,11 @@ class AppsSkill(Skill):
         root = ctx.project_root
         self.launcher = Launcher({**ctx.cfg.get("apps", {}), "apps": ctx.cfg.get("tools", {}).get("apps", {})},
                                  aliases_path=(root / "aliases.yaml") if root else None)
-        threading.Thread(target=self.launcher.build, name="jarvis-app-index", daemon=True).start()
+        def build():
+            from ..resources import lowest_thread_priority
+            lowest_thread_priority()                    # 1.0.8: background indexing never competes with the user
+            self.launcher.build()
+        threading.Thread(target=build, name="jarvis-app-index", daemon=True).start()
 
     def open(self, name: str, strict: bool = False) -> Optional[ToolResult]:
         e, sc = self.launcher.find(name)

@@ -201,6 +201,44 @@ def result_links(links: list[dict], min_w: int = 150) -> list[dict[str, Any]]:
     return out
 
 
+def browser_tabs(hwnd: int) -> list[dict]:
+    """Tabs of a Chromium/Firefox window: [{name, el, selected}] in strip order. [] if unavailable."""
+    if sys.platform != "win32":
+        return []
+    try:
+        UIA, auto = _uia()
+        root = auto.ElementFromHandle(hwnd)
+        cond = auto.CreatePropertyCondition(UIA.UIA_ControlTypePropertyId, UIA.UIA_TabItemControlTypeId)
+        arr = root.FindAll(UIA.TreeScope_Descendants, cond)
+        out = []
+        for i in range(arr.Length if arr else 0):
+            el = arr.GetElement(i)
+            sel = False
+            try:
+                sel = bool(el.GetCurrentPattern(UIA.UIA_SelectionItemPatternId).QueryInterface(
+                    UIA.IUIAutomationSelectionItemPattern).CurrentIsSelected)
+            except Exception:                   # noqa: BLE001
+                pass
+            out.append({"name": str(el.CurrentName or ""), "el": el, "selected": sel})
+        return out
+    except Exception as e:                      # noqa: BLE001
+        log.debug("UIA tabs: %s", e)
+        return []
+
+
+def select_tab(el: Any) -> bool:
+    """Make a browser tab active (SelectionItem.Select, Invoke as fallback)."""
+    if el is None or sys.platform != "win32":
+        return False
+    try:
+        UIA, _auto = _uia()
+        el.GetCurrentPattern(UIA.UIA_SelectionItemPatternId).QueryInterface(
+            UIA.IUIAutomationSelectionItemPattern).Select()
+        return True
+    except Exception:                           # noqa: BLE001
+        return invoke(el)
+
+
 def invoke(el: Any) -> bool:
     """Click a link element through UI Automation (same window, same tab)."""
     if el is None or sys.platform != "win32":

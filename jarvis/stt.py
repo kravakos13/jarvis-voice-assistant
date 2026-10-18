@@ -166,7 +166,10 @@ class SpeechToText:
             except Exception as e:
                 log.error("Whisper relocate: %s", e)
 
+    last_conf: Optional[tuple] = None
+
     def transcribe(self, audio, language: str | None = "default") -> str:
+        self.last_conf = None
         with self._lock:
             if self.model is None:          # unloaded in game mode -> reload on demand (CPU)
                 self.model = self._load("cpu", "int8")
@@ -216,7 +219,8 @@ class SpeechToText:
             segments, _info = self.model.transcribe(audio, **kw)
             segs = list(segments)
         text = accept(segs, self.initial_prompt, getattr(self, "hotwords", None))
-        log.debug("STT %.2f с: %r", time.time() - t0, text)
+        self.last_conf = utterance_conf(segs) if text else None     # no-name commands need a confident STT
+        log.debug("STT %.2f с: %r conf=%s", time.time() - t0, text, self.last_conf)
         return text
 
 
@@ -248,6 +252,13 @@ STANDALONE_NOSPEECH = 0.25
 def _plain(s: str) -> str:
     import re as _re
     return " ".join(_re.sub(r"[^\w\s]", " ", (s or "").lower().replace("ё", "е")).split())
+
+
+def utterance_conf(segments) -> Optional[tuple]:
+    """(worst avg_logprob, worst no_speech_prob) over the segments with text; None if there are none."""
+    lp = [float(getattr(sg, "avg_logprob", 0.0) or 0.0) for sg in segments if (getattr(sg, "text", "") or "").strip()]
+    ns = [float(getattr(sg, "no_speech_prob", 0.0) or 0.0) for sg in segments if (getattr(sg, "text", "") or "").strip()]
+    return (min(lp), max(ns)) if lp else None
 
 
 def accept(segments, prompt: str | None = None, hotwords: str | None = None) -> str:

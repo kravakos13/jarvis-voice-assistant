@@ -55,22 +55,72 @@ class FilesSkill(Skill):
         self.index: list[tuple[str, str]] = []      # (path, phonetic name)
         self.results: list[str] = []
         self._built = 0.0
-        threading.Thread(target=self.build_index, daemon=True).start()
+        self._building = False
+        self._load_cache()
+        # 1.0.8: no full disk walk at startup (it competed with Whisper/LLM loading): the cached index is used at
+        # once, the refresh runs later at the lowest thread priority and throttled
+        delay = float(self.cfg.get("index_delay_s", 120))
+        threading.Thread(target=self._delayed_build, args=(delay,), name="jarvis-files-index", daemon=True).start()
+
+    @staticmethod
+    def _cache_path() -> Path:
+        from ..config import LOCAL_SETTINGS
+        return Path(LOCAL_SETTINGS).parent / "cache" / "files_index.json"
+
+    def _load_cache(self) -> None:
+        try:
+            import json
+            data = json.loads(self._cache_path().read_text(encoding="utf-8"))
+            self.index = [tuple(x) for x in data.get("items", [])]   # type: ignore[misc]
+            self._built = float(data.get("built", 0))
+            log.info("Индекс файлов из кэша: %d", len(self.index))
+        except Exception:                                # noqa: BLE001
+            pass
+
+    def _save_cache(self) -> None:
+        try:
+            import json
+            p = self._cache_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"built": self._built, "items": self.index}, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, p)
+        except Exception as e:                           # noqa: BLE001
+            log.debug("files cache: %s", e)
+
+    def _delayed_build(self, delay: float) -> None:
+        if self.index and time.time() - self._built < 6 * 3600:
+            delay = max(delay, 600.0)                     # fresh cache: refresh much later
+        time.sleep(max(0.0, delay))
+        self.build_index()
 
     def build_index(self) -> int:
-        items, max_items = [], int(self.cfg.get("max_index", 300000))
-        for root in self.roots:
-            if not root.exists():
-                continue
-            for dirpath, dirnames, filenames in os.walk(root):
-                dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
-                for name in filenames + dirnames:
-                    items.append((os.path.join(dirpath, name), phonetic(Path(name).stem)))
-                if len(items) > max_items:
-                    break
-        self.index, self._built = items, time.time()
-        log.info("Индекс файлов: %d", len(items))
-        return len(items)
+        if self._building:
+            return len(self.index)
+        self._building = True
+        try:
+            from ..resources import lowest_thread_priority
+            lowest_thread_priority()
+            items, max_items = [], int(self.cfg.get("max_index", 300000))
+            dirs = 0
+            for root in self.roots:
+                if not root.exists():
+                    continue
+                for dirpath, dirnames, filenames in os.walk(root):
+                    dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+                    for name in filenames + dirnames:
+                        items.append((os.path.join(dirpath, name), phonetic(Path(name).stem)))
+                    dirs += 1
+                    if dirs % 200 == 0:
+                        time.sleep(0.02)                  # throttle: disk + CPU stay free for the user
+                    if len(items) > max_items:
+                        break
+            self.index, self._built = items, time.time()
+            log.info("Индекс файлов: %d", len(items))
+            self._save_cache()
+            return len(items)
+        finally:
+            self._building = False
 
     def search(self, query: str, limit: int = 5) -> list[str]:
         hits = windows_search(query, limit * 2) if self.cfg.get("use_windows_search", True) else []

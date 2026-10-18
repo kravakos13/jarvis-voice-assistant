@@ -294,12 +294,20 @@ function setQuality(q) {
   S.quality = q; bloom.enabled = q !== 'off';
   renderer.setPixelRatio(q === 'full' ? Math.min(window.devicePixelRatio, 1.5) : 1); fit();
   if (timer) clearInterval(timer);
-  timer = setInterval(frame, 1000 / ({ full: 30, lite: 20, off: 8 }[q] || 30));
+  timer = null;
+  if (S.paused) return;                       // 1.0.8: window hidden / in tray -> no rendering at all
+  let full = Math.max(10, Math.min(30, S.maxFps || 30));     // fps cap 30 («Нагрузка»)
+  if (S.state === 'sleeping' || S.state === 'muted') full = Math.min(full, 15);   // idle: slow breathing only
+  timer = setInterval(frame, 1000 / ({ full: full, lite: Math.min(20, full), off: 8 }[q] || full));
 }
+function setPaused(p) { S.paused = !!p; setQuality(S.quality); }
+function setMaxFps(n) { S.maxFps = n; setQuality(S.quality); }
 setQuality(S.quality);
 
 window.jarvis = {
-  setState(s) { S.state = s; document.getElementById('label').textContent = LABELS[s] || ''; },
+  setPaused, setMaxFps,
+  setState(s) { const idle = (x) => x === 'sleeping' || x === 'muted'; const ch = idle(s) !== idle(S.state);
+    S.state = s; document.getElementById('label').textContent = LABELS[s] || ''; if (ch) setQuality(S.quality); },
   setColor, setColorMode, setFace, setLandmarks,
   setMic(v) { S.mic = Math.max(0, Math.min(1, v)); },
   speak(env, dt, wid) { S.env = env || []; S.wid = wid || []; S.envDt = dt || 0.02; S.envStart = performance.now() / 1000; S.state = 'speaking'; },

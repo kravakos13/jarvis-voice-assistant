@@ -114,6 +114,6 @@ def test_never_types_into_jarvis_restores_previous_window(monkeypatch):
 def test_unicode_events_cyrillic_and_newline():
     ev = keyinput.unicode_events("Я\n😀")
     assert ev[0] == (0, ord("Я"), keyinput.KEYEVENTF_UNICODE)
-    assert ev[2][0] == keyinput.VK["enter"]
+    assert ev[2] == (0, 0x1C, keyinput.KEYEVENTF_SCANCODE)          # Enter as a scan code
     assert len(ev) == 2 + 2 + 4                              # emoji = surrogate pair
-    assert keyinput.combo_events("ctrl+backspace")[0][0] == 0x11 and keyinput.combo_events("ctrl+nope") is None
+    assert keyinput.combo_events("ctrl+backspace")[0][1] == 0x1D and keyinput.combo_events("ctrl+nope") is None

@@ -130,6 +130,10 @@ def main(argv=None) -> int:
     if args.ptt:
         cfg["assistant"]["mode"] = "ptt"
     setup_logging(cfg["logging"], args.verbose)
+    from . import resources                 # 1.0.8 «Нагрузка»: thread caps before numpy/ctranslate2/onnx load
+    resources.apply_env(cfg)
+    if resources.lower_priority(cfg):
+        log.info("Приоритет процесса: ниже обычного (пресет «%s»)", resources.preset(cfg)["name"])
     try:
         from .crash import install
         install()
