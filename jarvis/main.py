@@ -6,10 +6,11 @@ import logging
 import sys
 from logging.handlers import RotatingFileHandler
 
-from . import __version__
+from . import __version__, hfquiet
 from .config import load_config, resolve_path
 
 log = logging.getLogger("jarvis")
+hfquiet.quiet()                         # before anything imports huggingface_hub (constants read at import)
 
 
 def setup_logging(cfg: dict, verbose: bool = False) -> None:
@@ -33,6 +34,7 @@ def setup_logging(cfg: dict, verbose: bool = False) -> None:
     for noisy in ("urllib3", "faster_whisper", "httpx", "httpcore", "huggingface_hub", "filelock", "comtypes",
                   "telethon", "primp", "trafilatura", "PIL", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    hfquiet.quiet()                     # no HF symlink / "unauthenticated" warnings; never send a stray HF token
 
 
 def _fix_streams() -> None:

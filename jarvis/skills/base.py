@@ -50,7 +50,7 @@ class Skill:
 class SkillContext:
     cfg: dict
     llm: Any                                     # OllamaChat
-    say: Callable[[str], None]                   # speak asynchronously (reminders, timers)
+    say: Callable[..., None]                     # say_async(text, priority="normal"|"critical"|"low")
     notify: Callable[[str, str], None]
     project_root: Any = None
     extra: dict = field(default_factory=dict)

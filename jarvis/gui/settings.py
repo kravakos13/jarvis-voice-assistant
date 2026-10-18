@@ -576,12 +576,27 @@ class SettingsDialog(QDialog):
         self._add(f, "weather.timezone", "Часовой пояс")
         f2 = self._group(v, "Воздушные тревоги")
         self._add(f2, "alerts.enabled", "Включено", "bool")
-        self._add(f2, "alerts.backend", "Источник", "combo", options=[("siren", "siren.pp.ua (без ключа)"),
-                                                                       ("alerts_in_ua", "alerts.in.ua (нужен токен)"),
-                                                                       ("ubilling", "ubilling (без ключа, область)")])
+        self._add(f2, "alerts.backend", "Источник", "combo", options=[
+            ("auto", "Авто: alerts.in.ua (с токеном) → siren.pp.ua → ubilling.net.ua"),
+            ("siren", "siren.pp.ua (без ключа), запасные — остальные"),
+            ("ubilling", "ubilling.net.ua (без ключа, только область)"),
+            ("alerts_in_ua", "alerts.in.ua (нужен токен)")],
+            tip="Если источник недоступен, Джарвис сам переключается на запасной.")
         self._add(f2, "alerts.oblast", "Область", "combo", options=OBLASTS, editable=True)
         self._add(f2, "alerts.raions", "Только районы", "list", height=50, tip="Пусто = вся область. Напр. «Сумський район»")
-        self._add(f2, "alerts.alerts_in_ua_token", "Токен alerts.in.ua", password=True)
+        from ..alerts_sources import TOKEN_SECRET, stored_token
+        from ..secrets import mask as _mask
+        self.alerts_token = QLineEdit()
+        self.alerts_token.setEchoMode(QLineEdit.Password)
+        tok = stored_token(self.cfg.get("alerts") or {})
+        self.alerts_token.setPlaceholderText(f"сохранён ({_mask(tok)}) — оставь пустым, чтобы не менять" if tok
+                                             else "необязательно — бесплатно: alerts.in.ua/api-request")
+        self.alerts_token.setToolTip("Хранится зашифрованно (диспетчер учётных данных Windows), не в файле настроек.")
+        f2.addRow("Токен alerts.in.ua", self.alerts_token)
+        self._alerts_secret = TOKEN_SECRET
+        b_al = QPushButton("Проверить источники")
+        b_al.clicked.connect(self._alerts_test)
+        f2.addRow("", b_al)
         self._add(f2, "alerts.interval_s", "Опрос каждые", "int", min=10, max=300, suffix=" с")
         f3 = self._group(v, "Telegram")
         self._add(f3, "telegram.enabled", "Включено", "bool")
@@ -918,8 +933,9 @@ class SettingsDialog(QDialog):
             errs.append("SearXNG URL должен начинаться с http://")
         if get_path(ch, "telegram.enabled") and (not get_path(ch, "telegram.api_id") or not get_path(ch, "telegram.api_hash")):
             errs.append("Telegram: укажи api_id и api_hash или выключи модуль")
-        if get_path(ch, "alerts.backend") == "alerts_in_ua" and not get_path(ch, "alerts.alerts_in_ua_token"):
-            errs.append("alerts.in.ua: нужен токен (или выбери siren.pp.ua)")
+        if get_path(ch, "alerts.backend") == "alerts_in_ua" and not (
+                self.alerts_token.text().strip() or self._alerts_stored_token()):
+            errs.append("alerts.in.ua: нужен токен (или выбери «Авто»)")
         hk = {"Говорить": get_path(ch, "gui.hotkey_ptt"), "Пауза микрофона": get_path(ch, "gui.hotkey_mic"),
               "Показать окно": get_path(ch, "gui.hotkey_show"), "Вопрос по игре": get_path(ch, "gui.hotkey_game"),
               "Диктовка": get_path(ch, "dictate.hotkey")}
@@ -959,6 +975,10 @@ class SettingsDialog(QDialog):
                 from ..lumo import SMTP_SECRET
                 set_secret(SMTP_SECRET, self.smtp_pwd.text().strip())
                 self.smtp_pwd.clear()
+            if self.alerts_token.text().strip():
+                set_secret(self._alerts_secret, self.alerts_token.text().strip())
+                self.alerts_token.clear()
+                changed.append("alerts.backend")        # provider is rebuilt on restart
             new_dev = self.devices_edit.toPlainText()
             if new_dev != (self._devices_path.read_text(encoding="utf-8") if self._devices_path.exists() else ""):
                 self._devices_path.write_text(new_dev, encoding="utf-8")
@@ -1305,6 +1325,35 @@ class SettingsDialog(QDialog):
         from .. import google_auth as ga
         ga.disconnect()
         self._google_update("Отключён")
+
+    def _alerts_stored_token(self) -> str:
+        from ..alerts_sources import stored_token
+        return stored_token(self.cfg.get("alerts") or {})
+
+    def _alerts_test(self) -> None:
+        """Probe every alert source with the values in the dialog; short Russian result per source."""
+        from .. import alerts_sources as asrc
+        a = dict(self.cfg.get("alerts") or {})
+        a.update(oblast=self._get("alerts.oblast"), raions=self._get("alerts.raions") or [])
+        tok = self.alerts_token.text().strip() or self._alerts_stored_token()
+        self._flash("Проверяю источники тревог…")
+
+        def work():
+            parts = []
+            for key in asrc.DEFAULT_ORDER:
+                cls = asrc.SOURCES[key]
+                kw = {"token_getter": (lambda: tok)} if key == "alerts_in_ua" else {}
+                src = cls(a.get("oblast", ""), a.get("raions") or [], **kw)
+                if not src.available():
+                    parts.append(f"{cls.title}: без токена")
+                    continue
+                try:
+                    st = src.fetch()
+                    parts.append(f"{cls.title}: ✓ {'ТРЕВОГА' if st.active else 'тревоги нет'}")
+                except Exception as e:
+                    parts.append(f"{cls.title}: ✗ {asrc.short_reason(e)}")
+            self._sig.emit("flash", " · ".join(parts))
+        threading.Thread(target=work, daemon=True).start()
 
     def _smtp_test(self) -> None:
         from ..lumo import EMAIL_RE, SMTP_SECRET, smtp_check

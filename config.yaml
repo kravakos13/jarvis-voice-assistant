@@ -225,12 +225,13 @@ monitor:                     # температура ПК и предупреж
 
 alerts:                      # воздушные тревоги (говорит ВСЕГДА, даже в ночном/игровом режиме)
   enabled: true
-  backend: "siren"           # siren (без ключа) / alerts_in_ua (нужен токен) / ubilling (без ключа, только область)
+  backend: "auto"            # auto: alerts.in.ua (если задан токен) → siren.pp.ua → ubilling.net.ua (запасной, по области)
+                             # или явно siren / ubilling / alerts_in_ua — остальные всё равно остаются запасными
   oblast: "Сумська область"
   raions: []                 # пусто = вся область; напр. ["Сумський район"] — только свой район
   interval_s: 20
   announce_on_start: true    # если при запуске уже тревога — сказать
-  alerts_in_ua_token: ""     # https://alerts.in.ua/api-request
+  alerts_in_ua_token: ""     # лучше задать в Настройках (хранится зашифрованно); получить: https://alerts.in.ua/api-request
 
 profiles:                    # режимы: work (обычный), game (игровой), night (ночной)
   enabled: true
@@ -261,6 +262,7 @@ ollama:                      # локальный ИИ; Джарвис сам з
   start_tray_app: true       # сначала «ollama app.exe» (значок в трее, её же автозапуск), иначе «ollama serve»
   start_timeout_s: 30        # сколько ждать, пока Ollama ответит
   offer_install: true        # если Ollama нет — предложить установить (скачать ~1,6 ГБ)
+  auto_pull: true            # Ollama есть, а модели нет — сразу начать докачку с прогрессом (без вопроса)
   setup_url: "https://ollama.com/download/OllamaSetup.exe"
 
 lumo:                        # «Передать Люмо» — облачный ассистент по почте; ТОЛЬКО по явной команде, с подтверждением

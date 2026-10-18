@@ -1,6 +1,7 @@
 """Small reusable widgets: hotkey recorder, key/value table, diagnostics report dialog."""
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Callable, Optional
 
@@ -195,13 +196,19 @@ class DiagnosticsDialog(QDialog):
             self.accept()
             self.actions[fix_id]()
             return
+        wild = fix_id.split(":", 1)[0] + ":*"
+        if ":" in fix_id and wild in self.actions:     # e.g. "pull:qwen2.5:7b" -> GUI flow with progress bar
+            self.accept()
+            self.actions[wild](fix_id)
+            return
         self.status.setText("Выполняю...")
 
         def work():
             try:
                 from .. import diagnostics
                 msg = diagnostics.fix(fix_id, self.cfg)
-            except Exception as e:
-                msg = f"Не получилось: {e}"
+            except Exception:
+                logging.getLogger(__name__).exception("diagnostics fix %s", fix_id)
+                msg = "Не получилось (подробности в журнале)."
             self._done.emit(msg)
         threading.Thread(target=work, daemon=True).start()

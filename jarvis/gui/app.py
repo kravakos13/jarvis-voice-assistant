@@ -503,7 +503,13 @@ class Controller(QObject):
                  "Установить её сейчас? Скачается около 1,6 ГБ, права администратора не нужны, 5–20 минут. "
                  "Потом докачается модель ИИ (около 4,7 ГБ).")
         elif state == "running" and models:
-            q = f"Не скачаны модели ИИ: {', '.join(models)} (основная — около 4,7 ГБ).\n\nСкачать сейчас?"
+            gb = sum(osu.MODEL_SIZES_GB.get(m, 1.0) for m in models)
+            size = f"около {gb:.1f} ГБ".replace(".", ",")
+            if ask and oc.get("auto_pull", True):
+                ask = False             # Jarvis cannot answer without its model: just start (resumable) pulling
+                self.window.add_message("Система", f"Не скачана модель ИИ: {', '.join(models)} ({size}, один раз). "
+                                        "Начинаю загрузку — прогресс над полем ввода, при обрыве докачается.")
+            q = f"Не скачаны модели ИИ: {', '.join(models)} ({size}).\n\nСкачать сейчас?"
         elif state == "stopped":
             q = "Ollama установлена, но не запустилась.\n\nПопробовать запустить её ещё раз?"
         else:
@@ -513,20 +519,24 @@ class Controller(QObject):
                                     else "Модели можно скачать позже: «проверь себя» → «Скачать».")
             return
         self._ollama_busy = True
-        self.window.add_message("Система", "Готовлю Ollama… Прогресс — над полем ввода.")
+        if state != "running":
+            self.window.add_message("Система", "Готовлю Ollama… Прогресс — над полем ввода.")
+        self._ollama_cancel = threading.Event()
 
         def prog(label: str, pct: Optional[int]) -> None:
             self.emit_from_thread("progress", value=pct if pct is not None else 0, label=label)
 
         def work():
             try:
-                ok, msg = osu.ensure(self.cfg, progress=prog, allow_install=(state == "missing"))
+                ok, msg = osu.ensure(self.cfg, progress=prog, allow_install=(state == "missing"),
+                                     cancel=self._ollama_cancel)
                 if ok and self.assistant is not None:
                     self.assistant.recheck_llm()
-                text = f"Готово: {msg} Можно говорить." if ok else msg
+                text = (f"Готово: {msg} Можно говорить." if ok else
+                        msg + " Повторить: «проверь себя» → «Скачать» (продолжит с места обрыва).")
             except Exception as e:
                 log.exception("ollama flow: %s", e)
-                text = f"Не получилось подготовить Ollama: {e}"
+                text = "Не получилось подготовить Ollama (подробности в журнале). Попробуй «проверь себя»."
             finally:
                 self._ollama_busy = False
             self.emit_from_thread("progress", value=100)
@@ -641,7 +651,9 @@ class Controller(QObject):
                 f"{c['title']} — {c['detail']}" for c in bad) + ". Меню ⋯ → Самодиагностика.")
             return
         dlg = DiagnosticsDialog(checks, self.cfg, rerun=self.run_diagnostics, parent=self.window,
-                                actions={"install_ollama": lambda: self.ollama_flow("missing", ask=False)})
+                                actions={"install_ollama": lambda: self.ollama_flow("missing", ask=False),
+                                         "pull:*": lambda fid: self.ollama_flow(
+                                             "running", [fid.split(":", 1)[1]], ask=False)})
         dlg.show()
         self._diag_dlg = dlg
 

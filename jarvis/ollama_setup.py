@@ -338,36 +338,142 @@ def missing_models(cfg: dict, session=requests) -> list[str]:
     return [m for m in wanted_models(cfg) if m not in have and f"{m}:latest" not in have]
 
 
-def pull(cfg: dict, model: str, progress: Optional[Progress] = None, session=requests) -> None:
+MODEL_SIZES_GB = {"qwen2.5:7b": 4.7, "qwen2.5-coder:7b": 4.7, "nomic-embed-text": 0.27, "qwen2.5:3b": 1.9,
+                  "qwen2.5:1.5b": 1.0, "qwen2.5:14b": 9.0}
+
+
+def _gb(n: float) -> str:
+    return f"{n / 1024 ** 3:.1f}".replace(".", ",")
+
+
+def _short_error(body: str) -> str:
+    """Ollama's {"error": "..."} body -> a short reason (raw text goes to the log only)."""
+    import json
+    try:
+        msg = str(json.loads(body).get("error", ""))
+    except Exception:
+        msg = body
+    msg = msg.strip().splitlines()[0] if msg.strip() else ""
+    low = msg.lower()
+    if "file does not exist" in low or "not found" in low:
+        return "такой модели нет в библиотеке Ollama (проверь название)"
+    if "no space" in low or "disk" in low:
+        return "не хватает места на диске"
+    if any(k in low for k in ("tls", "dial tcp", "lookup", "no such host", "connection", "timeout", "max retries",
+                              "resolve", "redirect", "eof", "i/o")):
+        return "Ollama не смогла связаться с сервером моделей (проверь интернет)"
+    return "ошибка Ollama"
+
+
+class FatalPullError(OllamaSetupError):
+    """Retrying will not help (unknown model name, no disk space, cancelled)."""
+
+
+def pull(cfg: dict, model: str, progress: Optional[Progress] = None, session=requests,
+         cancel=None) -> None:
+    """Stream /api/pull. Success only if Ollama says {"status": "success"}: a stream that just ends (server
+    restarted, connection dropped) used to count as success in 1.0.2 and left the model missing."""
     import json
     try:
         with session.post(f"{host_of(cfg)}/api/pull", json={"model": model, "stream": True}, stream=True,
-                          timeout=(10, 3600)) as r:
-            r.raise_for_status()
-            shown = -1
+                          timeout=(10, 900)) as r:
+            if r.status_code >= 400:
+                body = ""
+                try:
+                    body = r.text[:500]
+                except Exception:
+                    pass
+                log.warning("ollama pull %s: HTTP %s %s", model, r.status_code, body)
+                reason = _short_error(body)
+                cls = FatalPullError if "нет в библиотеке" in reason else OllamaSetupError
+                raise cls(f"{model}: {reason} (HTTP {r.status_code})")
+            shown, done = -1, False
             for line in r.iter_lines():
+                if cancel is not None and cancel.is_set():
+                    raise FatalPullError(f"{model}: скачивание отменено")
                 if not line:
                     continue
-                d = json.loads(line)
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    log.debug("ollama pull %s: bad line %r", model, line[:200])
+                    continue
                 if d.get("error"):
-                    raise OllamaSetupError(f"{model}: {d['error']}")
+                    log.warning("ollama pull %s: %s", model, d["error"])
+                    reason = _short_error(json.dumps({"error": d["error"]}))
+                    cls = FatalPullError if ("нет в библиотеке" in reason or "места" in reason) else OllamaSetupError
+                    raise cls(f"{model}: {reason}")
+                if d.get("status") == "success":
+                    done = True
                 if progress and d.get("total"):
-                    pct = int(d.get("completed", 0) * 100 / d["total"])
-                    if pct != shown:
+                    total, comp = float(d["total"]), float(d.get("completed") or 0)
+                    pct = int(comp * 100 / total) if total else 0
+                    if pct != shown and total > 50 * 1024 ** 2:      # the big layer, not tiny manifests
                         shown = pct
-                        progress(f"Скачиваю модель {model}: {pct}%", pct)
+                        progress(f"Скачиваю модель {model}: {pct}% ({_gb(comp)} из {_gb(total)} ГБ)", pct)
+            if not done:
+                log.warning("ollama pull %s: stream ended without success", model)
+                raise OllamaSetupError(f"{model}: загрузка прервалась")
     except requests.RequestException as e:
+        log.warning("ollama pull %s: %r", model, e)
         raise OllamaSetupError(f"{model}: нет связи с Ollama ({type(e).__name__})") from None
 
 
-def pull_missing(cfg: dict, progress: Optional[Progress] = None, session=requests) -> list[str]:
-    """Pull every configured model that is not there yet. -> list of errors (empty = all good)."""
+def wait_ready(cfg: dict, timeout: float = 30.0, session=requests, sleep=time.sleep,
+               clock=time.monotonic) -> bool:
+    """Wait until the Ollama API answers (fresh install: tray app still starting its server)."""
+    deadline = clock() + timeout
+    while True:
+        if is_running(host_of(cfg), session):
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(1.0)
+
+
+def pull_with_retry(cfg: dict, model: str, progress: Optional[Progress] = None, session=requests,
+                    attempts: int = 3, sleep=time.sleep, backoff=(5, 20, 60), cancel=None,
+                    starter: Optional[Callable[[], bool]] = None) -> None:
+    """pull() up to `attempts` times; between attempts wait for (or restart) the server. Ollama resumes
+    partially downloaded layers, so a retry continues where it stopped. Verifies the model is listed."""
+    last: Optional[OllamaSetupError] = None
+    for n in range(1, attempts + 1):
+        if not wait_ready(cfg, 20 if n == 1 else 45, session=session, sleep=sleep):
+            log.warning("ollama pull %s: server not answering (attempt %d)", model, n)
+            if starter is not None:
+                starter()
+        try:
+            pull(cfg, model, progress, session, cancel=cancel)
+            if model in missing_models(cfg, session):
+                raise OllamaSetupError(f"{model}: после загрузки модель не появилась в списке")
+            log.info("ollama pull %s: ok (attempt %d)", model, n)
+            return
+        except FatalPullError:
+            raise
+        except OllamaSetupError as e:
+            last = e
+            log.warning("ollama pull %s: attempt %d/%d failed: %s", model, n, attempts, e)
+            if n < attempts:
+                pause = backoff[min(n - 1, len(backoff) - 1)]
+                if progress:
+                    progress(f"{e}. Повтор {n + 1} из {attempts} через {pause} с…", None)
+                sleep(pause)
+    assert last is not None
+    raise last
+
+
+def pull_missing(cfg: dict, progress: Optional[Progress] = None, session=requests, attempts: int = 3,
+                 sleep=time.sleep, cancel=None, starter: Optional[Callable[[], bool]] = None) -> list[str]:
+    """Pull every configured model that is not there yet (with retries). -> list of errors (empty = all good)."""
     errs = []
     for m in missing_models(cfg, session):
         try:
-            pull(cfg, m, progress, session)
+            pull_with_retry(cfg, m, progress, session, attempts=attempts, sleep=sleep, cancel=cancel,
+                            starter=starter)
         except OllamaSetupError as e:
             errs.append(str(e))
+            if cancel is not None and cancel.is_set():
+                break
     return errs
 
 
@@ -384,7 +490,8 @@ def ensure(cfg: dict, progress: Optional[Progress] = None, allow_install: bool =
             return False, str(e)
         if not start(cfg, wait=60, session=session, progress=progress):
             return False, friendly_error(cfg, "stopped")
-    errs = pull_missing(cfg, progress, session)
+    errs = pull_missing(cfg, progress, session, cancel=kw.get("cancel"),
+                        starter=lambda: start(cfg, wait=30, session=session))
     if errs:
         return False, "Не скачались модели: " + "; ".join(errs[:3])
     return True, "Ollama работает, модели на месте."

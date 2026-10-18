@@ -11,10 +11,14 @@ import argparse
 import sys
 from pathlib import Path
 
-import requests
-
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+from jarvis import hfquiet  # noqa: E402
+
+hfquiet.quiet()     # must precede any huggingface_hub import (hides symlink / HF_TOKEN warnings)
+
+import requests  # noqa: E402
 
 HF = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
 RU_VOICES = ["ru_RU-denis-medium", "ru_RU-dmitri-medium", "ru_RU-ruslan-medium", "ru_RU-irina-medium"]
@@ -70,15 +74,33 @@ def main() -> int:
                 ok = False
                 print(f"  ОШИБКА {url}: {e}")
     if not args.no_whisper:
-        print(f"Модель Whisper '{args.whisper}' (faster-whisper, скачивается один раз)...")
+        ok = download_whisper(args.whisper, resolve_path(cfg["stt"].get("download_root", "models/whisper"))) and ok
+    return 0 if ok else 1
+
+
+def download_whisper(size: str, cache_dir: Path, attempts: int = 3) -> bool:
+    """faster-whisper hides its progress bar -> print folder size every 2 s so it never looks frozen."""
+    import logging
+    import time
+    repo = hfquiet.repo_for(size)
+    total = hfquiet.expected_size(repo)
+    print(f"Модель распознавания речи Whisper «{size}»"
+          + (f" ({hfquiet.fmt_mb(total)} МБ)" if total else "") + " — скачивается один раз, подожди...")
+    for n in range(1, attempts + 1):
         try:
             from faster_whisper import download_model
-            path = download_model(args.whisper, cache_dir=str(resolve_path(cfg["stt"].get("download_root", "models/whisper"))))
-            print(f"  готово: {path}")
+            hfquiet.quiet()          # faster_whisper may have reset logger levels on import
+            with hfquiet.SizeMonitor(hfquiet.repo_folder(cache_dir, repo), total=total):
+                path = download_model(size, cache_dir=str(cache_dir))
+            print(f"\n  готово: {path}")
+            return True
         except Exception as e:
-            ok = False
-            print(f"  ОШИБКА: {e}")
-    return 0 if ok else 1
+            logging.getLogger("jarvis.install").debug("whisper download failed", exc_info=True)
+            print(f"\n  Не удалось скачать Whisper (попытка {n} из {attempts}): {type(e).__name__}")
+            if n < attempts:
+                time.sleep(5 * n)
+    print("  Whisper не скачан — Джарвис докачает его при первом запуске (нужен интернет).")
+    return False
 
 
 if __name__ == "__main__":

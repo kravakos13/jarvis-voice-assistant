@@ -88,9 +88,30 @@ def _progress():
     return cb
 
 
-def setup_ollama(no_install: bool = False, no_models: bool = False) -> bool:
-    """Install Ollama if missing (download with resume + silent setup), start it hidden, pull missing models."""
+def _log_to_file() -> None:
+    """jarvis.* log records (HTTP status / Ollama error bodies of failed pulls) also go to install.log."""
+    import logging
+    lg = logging.getLogger("jarvis")
+    for h in list(lg.handlers):
+        if getattr(h, "_install_log", False):
+            if getattr(h, "baseFilename", "") == str(Path(LOG).resolve()):
+                return
+            lg.removeHandler(h)
+            h.close()
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    h = logging.FileHandler(LOG, encoding="utf-8")
+    h.setFormatter(logging.Formatter("[%(asctime)s]   %(levelname)s %(name)s: %(message)s", "%H:%M:%S"))
+    h._install_log = True  # type: ignore[attr-defined]
+    lg.addHandler(h)
+    lg.setLevel(logging.INFO)
+
+
+def setup_ollama(no_install: bool = False, no_models: bool = False, sleep=time.sleep) -> bool:
+    """Install Ollama if missing (download with resume + silent setup), start it hidden, pull missing models.
+    1.0.3: waits until the API really answers (a fresh install's tray app needs time), retries each pull 3x with
+    backoff (Ollama resumes partial layers), requires Ollama's final "success" and re-checks /api/tags."""
     sys.path.insert(0, str(ROOT))
+    _log_to_file()
     try:
         from jarvis import ollama_setup as osu
         from jarvis.config import load_config
@@ -116,22 +137,34 @@ def setup_ollama(no_install: bool = False, no_models: bool = False) -> bool:
             log(f"[!] {e}")
             log("    Джарвис предложит установить Ollama при запуске, или: Пуск → Джарвис → «Докачать компоненты».")
             return False
-    if not osu.start(cfg, wait=60, progress=prog):
+    started = False
+    for n in range(1, 4):
+        if osu.start(cfg, wait=60, progress=prog) and osu.wait_ready(cfg, 30, sleep=sleep):
+            started = True
+            break
+        log(f"  Ollama пока не отвечает (попытка {n} из 3), жду...")
+        sleep(10 * n)
+    if not started:
         log("[!] " + osu.friendly_error(cfg))
+        log("    Модели ИИ Джарвис предложит скачать при запуске (окно с прогрессом).")
         return False
-    log("Ollama отвечает.")
+    log(f"Ollama отвечает ({osu.host_of(cfg)}).")
     if no_models:
         return True
     missing = osu.missing_models(cfg)
     if not missing:
         log("Модели ИИ уже скачаны.")
         return True
-    log("Скачиваю модели ИИ: " + ", ".join(missing) + " (может занять долго)")
-    errs = osu.pull_missing(cfg, prog)
+    log("Скачиваю модели ИИ: " + ", ".join(missing) + " (основная ~4,7 ГБ, может занять долго; "
+        "при обрыве докачивается)")
+    errs = osu.pull_missing(cfg, prog, sleep=sleep, starter=lambda: osu.start(cfg, wait=60))
     print()
     for err in errs:
-        log(f"  модель не скачалась: {err} — Джарвис предложит докачать при запуске")
-    return not errs
+        log(f"  [!] модель не скачалась: {err} — Джарвис сам начнёт докачку при запуске")
+    left = osu.missing_models(cfg)
+    log("Модели ИИ на месте: " + ", ".join(osu.wanted_models(cfg)) if not left
+        else "  Не хватает моделей: " + ", ".join(left))
+    return not left
 
 
 def main() -> int:

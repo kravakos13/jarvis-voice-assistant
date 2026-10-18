@@ -27,6 +27,11 @@ class Check:
     fixes: list = field(default_factory=list)   # [(fix_id, label)]
 
 
+def _raw(what: str, e: BaseException) -> None:
+    """Raw exception -> log only; the user sees a short Russian message."""
+    log.warning("diagnostics %s: %s: %s", what, type(e).__name__, e, exc_info=log.isEnabledFor(logging.DEBUG))
+
+
 def _mic(cfg, quick) -> Check:
     try:
         import sounddevice as sd
@@ -44,7 +49,8 @@ def _mic(cfg, quick) -> Check:
                          [("mic_privacy", "Доступ к микрофону"), ("sound_settings", "Настройки звука")])
         return Check("mic", "Микрофон", True, f"{name}: уровень {min(100, level * 800):.0f}%")
     except Exception as e:
-        return Check("mic", "Микрофон", False, f"Микрофон недоступен: {e}",
+        _raw("mic", e)
+        return Check("mic", "Микрофон", False, "Микрофон не найден или занят другой программой.",
                      [("mic_privacy", "Доступ к микрофону"), ("sound_settings", "Настройки звука")])
 
 
@@ -55,7 +61,9 @@ def _whisper(cfg, assistant, quick) -> Check:
     try:
         import faster_whisper  # noqa: F401
     except Exception as e:
-        return Check("whisper", "Распознавание (Whisper)", False, f"faster-whisper не установлен: {e}")
+        _raw("whisper import", e)
+        return Check("whisper", "Распознавание (Whisper)", False,
+                     "Модуль распознавания не установлен — Пуск → Джарвис → «Докачать компоненты».")
     if quick:
         return Check("whisper", "Распознавание (Whisper)", None, "Ещё не загружена (текстовый режим или загрузка).")
     try:
@@ -63,7 +71,9 @@ def _whisper(cfg, assistant, quick) -> Check:
         s = SpeechToText(cfg["stt"])
         return Check("whisper", "Распознавание (Whisper)", True, f"Загружается на {s.device}")
     except Exception as e:
-        return Check("whisper", "Распознавание (Whisper)", False, f"Не загрузилась: {e}")
+        _raw("whisper load", e)
+        return Check("whisper", "Распознавание (Whisper)", False,
+                     "Модель не загрузилась (подробности в журнале). Без интернета первая загрузка невозможна.")
 
 
 def _ollama(cfg) -> list[Check]:
@@ -91,7 +101,8 @@ def _ollama(cfg) -> list[Check]:
             continue
         ok = m in have or f"{m}:latest" in have
         out.append(Check(f"model:{m}", title, True if ok else (False if required else None),
-                         f"{m} {'есть' if ok else 'не скачана'}", [] if ok else [(f"pull:{m}", f"Скачать {m}")]))
+                         f"{m} {'есть' if ok else 'не скачана — нажми «Скачать»'}",
+                         [] if ok else [(f"pull:{m}", f"Скачать {m}")]))
     return out
 
 
@@ -111,7 +122,8 @@ def _piper(cfg, quick) -> Check:
         audio, _ = PiperTTS(t).synthesize("Проверка.")
         return Check("tts", "Голос (Piper)", bool(audio.size), f"{voice}: синтез {time.time() - t0:.1f} с")
     except Exception as e:
-        return Check("tts", "Голос (Piper)", False, f"Ошибка синтеза: {e}")
+        _raw("tts", e)
+        return Check("tts", "Голос (Piper)", False, "Голос не синтезируется (подробности в журнале).")
 
 
 def _output(cfg) -> Check:
@@ -122,7 +134,8 @@ def _output(cfg) -> Check:
         info = sd.query_devices(dev if dev is not None else sd.default.device[1], "output")
         return Check("output", "Вывод звука", True, info["name"])
     except Exception as e:
-        return Check("output", "Вывод звука", False, f"Нет устройства вывода: {e}", [("sound_settings", "Настройки звука")])
+        _raw("output", e)
+        return Check("output", "Вывод звука", False, "Нет устройства вывода звука.", [("sound_settings", "Настройки звука")])
 
 
 def _internet() -> Check:
@@ -136,21 +149,26 @@ def _internet() -> Check:
 
 
 def _alerts(cfg, assistant) -> Optional[Check]:
+    """Short Russian status of the alert sources (siren.pp.ua -> ubilling.net.ua fallback, alerts.in.ua with token)."""
+    from . import alerts_sources as asrc
     a = cfg.get("alerts", {})
     if not a.get("enabled"):
         return None
-    if a.get("backend") == "alerts_in_ua" and not a.get("alerts_in_ua_token"):
-        return Check("alerts", "Воздушные тревоги", False, "Для alerts.in.ua нужен токен.", [("settings:integrations", "Указать токен")])
+    fix = [("settings:integrations", "Настройки тревог")]
+    if a.get("backend") == "alerts_in_ua" and not asrc.stored_token(a):
+        return Check("alerts", "Воздушные тревоги", None,
+                     "Для alerts.in.ua нужен токен — пока работаю через siren.pp.ua / ubilling.net.ua.", fix)
     sk = assistant.router.by_name.get("alerts") if assistant else None
     try:
-        if sk:
-            active, _, _ = sk.fetch()
-        else:
-            active = None
-            requests.get("https://siren.pp.ua/api/v3/alerts", timeout=8).raise_for_status()
-        return Check("alerts", "Воздушные тревоги", True, "Источник отвечает" + ("" if active is None else (" — сейчас ТРЕВОГА" if active else " — тревоги нет")))
+        prov = sk if (sk is not None and hasattr(sk, "summary")) else asrc.AlertProvider(a)
+        ok, text = prov.summary()
+        if ok is False:                 # right after login the network is often not up yet: one more try
+            time.sleep(5)
+            ok, text = prov.summary()
     except Exception as e:
-        return Check("alerts", "Воздушные тревоги", False, f"Источник недоступен: {e}")
+        _raw("alerts", e)
+        ok, text = False, "Источники тревог не проверились (подробности в журнале)."
+    return Check("alerts", "Воздушные тревоги", ok, text, [] if ok else fix)
 
 
 def _telegram(cfg) -> Optional[Check]:
@@ -232,11 +250,13 @@ def fix(fix_id: str, cfg: dict) -> str:
         ok, msg = osu.ensure(cfg, allow_install=True)
         return msg
     if fix_id.startswith("pull:"):
-        from .updater import pull_models
+        from . import ollama_setup as osu
         m = fix_id[5:]
-        sub = {"llm": dict(cfg["llm"], model=m), "code": {}, "memory": {"embed_model": None}}
-        errs = pull_models(sub)
-        return f"Ошибка: {errs[0]}" if errs else f"Модель {m} скачана."
+        try:
+            osu.pull_with_retry(cfg, m)
+        except osu.OllamaSetupError as e:
+            return f"Не скачалась: {e}"
+        return f"Модель {m} скачана."
     if fix_id == "download_voice":
         from .tts import ensure_voice
         v = cfg["tts"].get("piper_voice", "ru_RU-denis-medium")

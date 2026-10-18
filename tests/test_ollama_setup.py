@@ -257,8 +257,10 @@ class Pulls(Server):
         self.pulled.append(m)
         if m in self.fail:
             return R(200, lines=[b'{"error":"pull model manifest: file does not exist"}'])
-        return R(200, lines=[b'{"status":"pulling","total":100,"completed":50}', b"",
-                             b'{"status":"pulling","total":100,"completed":100}', b'{"status":"success"}'])
+        self.models.append(m)
+        return R(200, lines=[b'{"status":"pulling manifest"}', b'{"status":"pulling","total":4000000000,"completed":2000000000}',
+                             b"", b"not json", b'{"status":"pulling","total":4000000000,"completed":4000000000}',
+                             b'{"status":"success"}'])
 
 
 def test_missing_models_and_pull():
@@ -266,7 +268,7 @@ def test_missing_models_and_pull():
     assert osu.missing_models(cfg(), s) == ["qwen2.5-coder:7b"]
     seen = []
     assert osu.pull_missing(cfg(), lambda l, p: seen.append(p), s) == [] and s.pulled == ["qwen2.5-coder:7b"]
-    assert seen == [50, 100]
+    assert seen == [50, 100]                      # only the big layer, from GB-sized totals
     s = Pulls([], fail={"qwen2.5:7b"})
     errs = osu.pull_missing(cfg(), None, s)
     assert len(errs) == 1 and "qwen2.5:7b" in errs[0] and s.pulled == ["qwen2.5:7b", "qwen2.5-coder:7b", "nomic-embed-text"]
@@ -287,7 +289,7 @@ def test_ensure_chain(monkeypatch, install_dir):
         state["installed"] = True
         return install_dir.exe
     monkeypatch.setattr(osu, "install", inst)
-    monkeypatch.setattr(osu, "pull_missing", lambda c, p=None, s=None: events.append("pull") or [])
+    monkeypatch.setattr(osu, "pull_missing", lambda c, p=None, s=None, **k: events.append("pull") or [])
     ok, msg = osu.ensure(cfg(), allow_install=False)
     assert not ok and "не установлена" in msg and events == ["start"]
     events.clear()
@@ -336,11 +338,122 @@ def test_postinstall_installs_starts_and_pulls(monkeypatch, tmp_path):
     monkeypatch.setattr(osu, "find_exe", lambda *a, **k: None)
     monkeypatch.setattr(osu, "install", lambda c, p=None: calls.append("install") or Path("C:/x/ollama.exe"))
     monkeypatch.setattr(osu, "start", lambda c, wait=30, progress=None: calls.append(("start", wait)) or True)
-    monkeypatch.setattr(osu, "missing_models", lambda c: ["qwen2.5:7b"])
-    monkeypatch.setattr(osu, "pull_missing", lambda c, p=None: calls.append("pull") or [])
-    assert pi.setup_ollama() is True and calls == ["install", ("start", 60), "pull"]
+    monkeypatch.setattr(osu, "wait_ready", lambda c, t=30, **k: True)
+    left = {"m": ["qwen2.5:7b"]}
+    monkeypatch.setattr(osu, "missing_models", lambda c: list(left["m"]))
+
+    def pm(c, p=None, **k):
+        calls.append("pull")
+        left["m"] = []
+        return []
+    monkeypatch.setattr(osu, "pull_missing", pm)
+    assert pi.setup_ollama(sleep=lambda s: None) is True and calls == ["install", ("start", 60), "pull"]
     monkeypatch.setattr(osu, "install", lambda c, p=None: (_ for _ in ()).throw(osu.OllamaSetupError("нет сети")))
-    assert pi.setup_ollama() is False
+    assert pi.setup_ollama(sleep=lambda s: None) is False
     logtext = (tmp_path / "install.log").read_text(encoding="utf-8")
     assert "нет сети" in logtext and "предложит установить Ollama" in logtext
     json.dumps(logtext)
+
+
+# ------------------------------------------------------------------ 1.0.3: strict pulls with retries
+class FlakyPulls(Server):
+    """Each call pops the next scripted response: 'cut' (stream ends without success), 'http500', 'ok'."""
+    def __init__(self, script, models=()):
+        super().__init__(up_after=0, models=models)
+        self.script, self.posts = list(script), 0
+
+    def post(self, url, json=None, stream=None, timeout=None):
+        self.posts += 1
+        step = self.script.pop(0)
+        if step == "cut":
+            return R(200, lines=[b'{"status":"pulling","total":4000000000,"completed":1000000000}'])
+        if step == "http500":
+            r = R(500, lines=[])
+            r.text = '{"error":"dial tcp: lookup registry.ollama.ai: no such host"}'
+            return r
+        if step == "conn":
+            raise requests.ConnectionError("reset")
+        self.models.append(json["model"])
+        return R(200, lines=[b'{"status":"success"}'])
+
+
+def test_pull_stream_cut_is_not_success_and_retries(caplog):
+    s = FlakyPulls(["cut", "http500", "ok"])
+    sleeps, labels = [], []
+    osu.pull_with_retry(cfg(), "qwen2.5:7b", lambda l, p: labels.append((l, p)), s, sleep=sleeps.append)
+    assert s.posts == 3 and sleeps == [5, 20] and "qwen2.5:7b" in s.models
+    assert any("Повтор 2 из 3" in l for l, _ in labels) and any("прервалась" in l for l, _ in labels)
+    assert any("no such host" in r.getMessage() for r in caplog.records)        # raw body -> log only
+    assert any("Ollama не смогла связаться" in l for l, _ in labels)            # short reason -> user
+
+
+def test_pull_gives_up_after_attempts():
+    s = FlakyPulls(["cut", "conn", "cut"])
+    with pytest.raises(osu.OllamaSetupError, match="прервалась"):
+        osu.pull_with_retry(cfg(), "qwen2.5:7b", None, s, sleep=lambda x: None)
+    assert s.posts == 3
+    assert osu.pull_missing(cfg(), None, FlakyPulls(["cut"] * 9), sleep=lambda x: None, attempts=3)[0].startswith(
+        "qwen2.5:7b: загрузка прервалась")
+
+
+def test_pull_unknown_model_is_not_retried():
+    s = Pulls([], fail={"qwen9:99b"})
+    with pytest.raises(osu.FatalPullError, match="нет в библиотеке"):
+        osu.pull_with_retry(cfg(), "qwen9:99b", None, s, sleep=lambda x: pytest.fail("no retry"))
+    assert s.pulled == ["qwen9:99b"]
+
+
+def test_pull_waits_for_server_and_restarts_it():
+    srv = Pulls([])
+    srv.up_after = 10**9                                   # down
+    started = []
+
+    def starter():
+        started.append(1)
+        srv.up_after = 0
+        srv.checks = 0
+        return True
+    clock = {"t": 0.0}
+
+    def sleep(x):
+        clock["t"] += x
+    assert not osu.wait_ready(cfg(), 5, session=srv, sleep=sleep, clock=lambda: clock["t"])
+    osu.pull_with_retry(cfg(), "qwen2.5:7b", None, srv, sleep=sleep, starter=starter)
+    assert started == [1] and "qwen2.5:7b" in srv.models
+
+
+def test_pull_cancel():
+    import threading
+    ev = threading.Event()
+    ev.set()
+    s = FlakyPulls(["cut"])
+    with pytest.raises(osu.FatalPullError, match="отменено"):
+        osu.pull_with_retry(cfg(), "qwen2.5:7b", None, s, sleep=lambda x: None, cancel=ev)
+
+
+def test_postinstall_retries_start_and_logs(monkeypatch, tmp_path):
+    spec = importlib.util.spec_from_file_location("postinstall2", Path(__file__).resolve().parents[1] / "installer" / "postinstall.py")
+    pi = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pi)
+    monkeypatch.setattr(pi, "LOG", tmp_path / "install.log")
+    monkeypatch.setattr(osu, "find_exe", lambda *a, **k: Path("C:/x/ollama.exe"))
+    st = {"n": 0}
+
+    def start(c, wait=30, progress=None):
+        st["n"] += 1
+        return st["n"] >= 2                                 # server not up on the first try (fresh install race)
+    monkeypatch.setattr(osu, "start", start)
+    monkeypatch.setattr(osu, "wait_ready", lambda c, t=30, **k: True)
+    monkeypatch.setattr(osu, "missing_models", lambda c: ["qwen2.5:7b"])
+    monkeypatch.setattr(osu, "pull_missing", lambda c, p=None, **k: ["qwen2.5:7b: загрузка прервалась"])
+    assert pi.setup_ollama(sleep=lambda s: None) is False and st["n"] == 2
+    text = (tmp_path / "install.log").read_text(encoding="utf-8")
+    assert "попытка 1 из 3" in text and "модель не скачалась: qwen2.5:7b: загрузка прервалась" in text
+    assert "Не хватает моделей: qwen2.5:7b" in text
+
+
+def test_short_error_maps_network_failures():
+    assert "связаться" in osu._short_error('{"error":"max retries exceeded: Get \\"https://x.r2.cloudflarestorage.com/..\\""}')
+    assert "связаться" in osu._short_error('{"error":"dial tcp: lookup registry.ollama.ai: no such host"}')
+    assert "нет в библиотеке" in osu._short_error('{"error":"pull model manifest: file does not exist"}')
+    assert osu._short_error("garbage") == "ошибка Ollama"
